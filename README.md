@@ -54,7 +54,42 @@ REPORT: sample/example-run/report.md and report.json, under your reports folder
 
 ## Quickstart
 
-Download or clone this repository, then:
+Download or clone this repository. **Python 3.11 or newer and Git are required**:
+`tomllib` is part of Python's standard library starting in 3.11. No runtime
+packages, virtual environment or installation are needed to run the script.
+
+On Linux or macOS, start here:
+
+```sh
+python3 --version
+python3 release_check.py --help
+```
+
+On macOS, the system `python3` may be 3.9. Get a newer Python from
+[python.org](https://www.python.org/downloads/macos/), Homebrew
+(`brew install python@3.11`), or uv. With Homebrew, use `python3.11` in place of
+`python3` throughout this README. With uv, run
+`uv run --no-project --python 3.11 python release_check.py --help`;
+replace `--help` with your audit arguments. These options can also supply a
+Python with working venv support for `--verify`.
+
+On Windows, use PowerShell and the Python launcher:
+
+```powershell
+py -3 --version
+py -3 release_check.py --help
+```
+
+If the selected Python is older than 3.11, install a newer version from
+[python.org](https://www.python.org/downloads/windows/) or run
+`winget install --exact --id Python.Python.3.11`. After installing 3.11, select it
+with `py -3.11 release_check.py --help`. Windows may map `python3` to a Microsoft
+Store shortcut; use `py -3` (or `py -3.11`) in place of `python3` in the examples.
+
+### Optional installed command
+
+For an installed `release-check` command, use a venv or `pipx install .`.
+On Linux or macOS with a supported Python:
 
 ```sh
 python3 -m venv .venv
@@ -63,13 +98,27 @@ python -m pip install .
 release-check --help
 ```
 
-You can also run `python3 release_check.py` directly without installing it.
-The package install and installed command have been verified in a fresh Python
-3.11 venv. A working `python3 -m venv` is needed for installation and `--verify`;
-on Debian/Ubuntu, install the matching `python3-venv` package if it is missing.
+In Windows PowerShell, the equivalent is:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install .
+release-check --help
+```
+
+If PowerShell's policy prevents activation, invoke `.\.venv\Scripts\python.exe`
+and `.\.venv\Scripts\release-check.exe` directly; activation is optional.
+A working venv with pip is needed for the optional package install and `--verify`.
+On Debian/Ubuntu, a missing `ensurepip` usually means the matching `python3-venv`
+package (or a versioned package such as `python3.11-venv`) is absent. Ask your
+administrator to install it, or use a supported Python from python.org or uv.
+Audits and exports without `--verify` still work through the direct script.
 The build backend requires `setuptools>=77`; a fresh install may need package-index
 access even though the tool has no runtime dependencies. Offline, use the direct
-Python command for audits without verification.
+Python command for audits without verification. In the examples below, replace
+`release-check` with `python3 release_check.py` if you use the direct script,
+or `py -3 release_check.py` in PowerShell.
 Prepare the private terms file below before your first audit.
 
 ## Your private terms file
@@ -105,6 +154,13 @@ Use `--denylist FILE` each time, or set a default once for many repositories:
 ```sh
 export RELEASE_CHECK_DENYLIST=/private/terms.json
 export RELEASE_CHECK_REPORTS=/private/reports
+```
+
+In PowerShell, use your private paths:
+
+```powershell
+$env:RELEASE_CHECK_DENYLIST = 'C:\private\terms.json'
+$env:RELEASE_CHECK_REPORTS = 'C:\private\reports'
 ```
 
 Without a reports override, reports go to `~/.local/state/release-check`.

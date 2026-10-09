@@ -21,6 +21,14 @@ import signal
 import subprocess
 import sys
 import tempfile
+if sys.version_info < (3, 11):
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    message = f"release-check needs Python 3.11 or newer; you have {version}."
+    if "--json" in sys.argv[1:]:
+        print(json.dumps({"ready": False, "error": "audit-incomplete", "code": "python-version", "verdict": "INCOMPLETE", "message": message}), file=sys.stderr)
+    else:
+        print(message, file=sys.stderr)
+    raise SystemExit(2)
 import tomllib
 import tokenize
 import unicodedata
