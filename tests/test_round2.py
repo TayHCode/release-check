@@ -239,17 +239,18 @@ class Round2Tests(unittest.TestCase):
                     return 1, b'creation failed'
                 binaries = {'git': git, 'uv': str(self.root / 'uv'), 'virtualenv': str(self.root / 'virtualenv')}
                 with patch.object(rc.shutil, 'which', side_effect=lambda name: binaries.get(name)), patch.object(rc, 'command', side_effect=attempt):
-                    python, _ = rc.verification_venv(workspace, 30)
+                    python, _, route = rc.verification_venv(workspace, 30)
                 expected = ['stdlib', 'uv', 'virtualenv']
                 self.assertEqual(calls, expected[:expected.index(successful) + 1] if successful else expected)
                 self.assertEqual(python is not None, successful is not None)
+                self.assertEqual(route, "venv" if successful == "stdlib" else successful or "not-run")
 
     def test_absent_fallbacks_are_not_invoked(self):
         git = shutil.which('git')
         workspace = self.root / 'absent'
         workspace.mkdir()
         with patch.object(rc.shutil, 'which', side_effect=lambda name: git if name == 'git' else None), patch.object(rc, 'command', return_value=(1, b'no ensurepip')) as run:
-            python, _ = rc.verification_venv(workspace, 30)
+            python, _, route = rc.verification_venv(workspace, 30)
         self.assertIsNone(python)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(run.call_args.args[0][1:3], ['-m', 'venv'])

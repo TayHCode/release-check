@@ -42,7 +42,7 @@ WARNINGS - reported, not blocking
 
 PLAN
  1. [tool, done] Read the working files and all 2 commits of local history. Change nothing in the repository.
- 2. [tool, planned] Discard all history. The export gets one new commit. This removes 0 findings that exist only in old commits, author names or commit messages.
+ 2. [tool, planned] Discard all history. The export gets one new commit. This removes 0 findings from history and commit metadata; matching working-file content still needs fixing.
  3. [you, needed] Fix 1 license, documentation, test or coverage items listed under BLOCKING.
 
 TEST BEFORE PUBLISHING
@@ -102,7 +102,7 @@ For an installed `release-check` command, use a venv or `pipx install .`.
 On Linux or macOS with a supported Python:
 
 ```sh
-python3 -m venv .venv
+python3 release_check.py --help && python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install .
 release-check --help
@@ -111,6 +111,8 @@ release-check --help
 In Windows PowerShell, the equivalent is:
 
 ```powershell
+py -3 release_check.py --help
+if ($LASTEXITCODE -ne 0) { throw "Use Python 3.11 or newer before installing." }
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install .
@@ -232,7 +234,9 @@ and verify the export. Do not approve a real personal address to silence the gat
 Use `--json` for scripts: the first line retains the `ready`, `counts` and `report`
 summary, with `export_ready` and `export_counts` when exporting. In that mode,
 `--scrub-plan` adds a second JSON document. The saved reports always include the
-verdict, plan and test list. Error JSON includes a fixed `code`, never the argument.
+verdict, plan and test list. Error JSON includes a fixed `code`. Destination
+collisions also name the exact requested/blocked paths in `message`; malformed
+terms JSON includes only the syntax line and column. Other errors omit arguments.
 Blocked exports also include `export_warning` in the JSON summary and a warning
 in the readable verdict. Each group shows up to ten locations in the terminal;
 `report.md` and `report.json` retain every finding.
@@ -272,11 +276,15 @@ For a project whose declared commands need only Python's standard library, set
 `"stdlib_only": true` in its manifest and run `--verify-no-venv` instead of
 `--verify`. This still runs the exact declared commands in a fresh clone with a
 clean HOME and the current interpreter, and labels the result **less isolated**.
-Python launchers (`python`, `python3`, `py -3`) select that current interpreter.
+Python launchers (`python`, `python3`, `py`, `py -3`) select that current interpreter.
 This is an explicit owner declaration, not dependency inference. Do not use it
 for commands that install or import third-party packages. Declared dependencies
 and optional dependencies are rejected; dependency metadata is not audited in
 this mode. The tool's own install quickstart requires ordinary `--verify`.
+With ordinary `--verify`, these same Python launchers select the verification
+environment's interpreter, including in Windows manifests. The verdict labels
+the builder used: `venv`, `uv` or `virtualenv`; stdlib verification shows `no-venv`
+and its lower isolation.
 Windows verification uses the venv's `Scripts` directory and isolated Windows
 profile/temp folders; Linux and macOS use `bin`. Declared commands must be
 available in that fresh environment, rather than only in your personal PATH.
@@ -445,7 +453,10 @@ and source provenance still need human review.
   configuration including remote URLs. These are discarded by the export.
 - Emails with ordinary or quoted local parts, including HTML entities, URL-encoded
   at signs, fullwidth at signs and bracketed at/dot spellings. This is not a full
-  email grammar or arbitrary obfuscation decoder.
+  email grammar or arbitrary obfuscation decoder. GitHub public noreply addresses
+  of the exact form `username@users.noreply.github.com` or
+  `12345+username@users.noreply.github.com` are exempt from email findings;
+  private-term matches still block.
 - Phones shaped as US 3-3-4 groups, ten contiguous digits starting 2–9, local 0-prefixed 4/5+6
   groups, or 8–15 digits beginning with plus/00 and optional spaces, dots or
   hyphens. Dates and identifiers can need false-positive approvals.

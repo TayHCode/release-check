@@ -154,6 +154,7 @@ ERRORS: dict[str, str] = {
     "denylist-required": "Pass --denylist FILE or set RELEASE_CHECK_DENYLIST. The README shows how to make the file.",
     "denylist-not-found": "The private-terms file does not exist.",
     "denylist-schema": "The private-terms file is empty or not in a supported format.",
+    "denylist-json": "The private-terms file is not valid JSON. Correct the JSON syntax and run again.",
     "denylist-encoding": "The private-terms file must be UTF-8 (an optional UTF-8 BOM is accepted). Save it as UTF-8, not UTF-16 or a legacy encoding.",
     "denylist-inside-source": "Keep the private-terms file outside the repository being audited.",
     "reports-inside-source": "Choose a reports folder outside the repository being audited.",
@@ -179,7 +180,11 @@ ERRORS: dict[str, str] = {
 
 
 class AuditError(Exception):
-    """Errors use a generic code, never exception contents."""
+    """Errors use a fixed code; only deliberate diagnostics may add details."""
+
+    def __init__(self, code: str, detail: str | None = None):
+        super().__init__(code)
+        self.detail = detail
 
 
 class PrivateParser(argparse.ArgumentParser):
@@ -189,11 +194,14 @@ class PrivateParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
-def print_error(code: str, json_mode: bool):
+def print_error(code: str, json_mode: bool, detail: str | None = None):
     if json_mode:
-        print(json.dumps({"ready": False, "error": "audit-incomplete", "code": code}), file=sys.stderr)
+        error = {"ready": False, "error": "audit-incomplete", "code": code}
+        if detail:
+            error["message"] = ERRORS[code] + " " + detail
+        print(json.dumps(error), file=sys.stderr)
     else:
-        print(f"release-check {VERSION}\nVERDICT: INCOMPLETE\nReason: {code} - {ERRORS[code]}", file=sys.stderr)
+        print(f"release-check {VERSION}\nVERDICT: INCOMPLETE\nReason: {code} - {ERRORS[code]}" + (" " + detail if detail else ""), file=sys.stderr)
 
 
 def fingerprint(value: str | bytes) -> str:
@@ -261,8 +269,8 @@ def load_terms(path: Path) -> list[str]:
     if path.suffix.lower() == ".json" or raw.lstrip().startswith(("[", "{")):
         try:
             obj = json.loads(raw)
-        except ValueError:
-            raise AuditError("denylist-schema") from None
+        except json.JSONDecodeError as error:
+            raise AuditError("denylist-json", f"Syntax error at line {error.lineno}, column {error.colno}.") from None
         if isinstance(obj, dict):
             domains = obj.get("internal_domains", [])
         if isinstance(obj, list):
@@ -435,6 +443,8 @@ class Scanner:
                         self.add(scope, "personal", "internal-host", path, number, match.group(), object_id=object_id)
                 for kind, pattern in PATTERNS.items():
                     for match in re.finditer(pattern, personal_line, re.I):
+                        if kind == "email" and re.fullmatch(r"(?:[0-9]+\+)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?@users\.noreply\.github\.com", match.group(), re.I):
+                            continue
                         if kind == "internal-host" and host_example(match.group()):
                             continue
                         self.add(scope, "personal", kind, path, number, match.group(), object_id=object_id)
@@ -681,9 +691,15 @@ def submodule_paths(repo: Path) -> set[str]:
             if entry.startswith(b"160000 ")}
 
 
+def export_destination_error(*paths: Path) -> AuditError:
+    existing = [str(path) for path in paths if path.exists() or path.is_symlink()]
+    return AuditError("export-destination-exists", "In the way: " + ", ".join(json.dumps(path) for path in existing)
+                      + ". Keep these folders and rerun the same command with --export NEW_DIR, where NEW_DIR and NEW_DIR.BLOCKED do not exist.")
+
+
 def copy_tree(repo: Path, target: Path, manifest: dict, scanner: Scanner):
-    if target.exists():
-        raise AuditError("export-destination-exists")
+    if target.exists() or target.is_symlink():
+        raise export_destination_error(target)
     if target == repo or repo in target.parents:
         raise AuditError("export-inside-source")
     if target in repo.parents:
@@ -913,26 +929,35 @@ def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -
     return {"packages": len(packages), "blocked": count, "owner_dispositions": dispositions}
 
 
-def verification_venv(workspace: Path, timeout: int) -> tuple[Path | None, bytes]:
+def verification_venv(workspace: Path, timeout: int) -> tuple[Path | None, bytes, str]:
     """Use the current Python first; external builders get the same clean HOME."""
     env_dir = workspace / "venv"
     environment = safe_environment(workspace / "home", Path(sys.executable).parent)
-    attempts = [[sys.executable, "-m", "venv", str(env_dir)]]
+    attempts = [("venv", [sys.executable, "-m", "venv", str(env_dir)])]
     uv = shutil.which("uv")
     virtualenv = shutil.which("virtualenv")
     if uv:
-        attempts.append([uv, "venv", "--seed", "--python", sys.executable, str(env_dir)])
+        attempts.append(("uv", [uv, "venv", "--seed", "--python", sys.executable, str(env_dir)]))
     if virtualenv:
-        attempts.append([virtualenv, "--python", sys.executable, str(env_dir)])
+        attempts.append(("virtualenv", [virtualenv, "--python", sys.executable, str(env_dir)]))
     output = b""
-    for argv in attempts:
+    for route, argv in attempts:
         if env_dir.exists():
             shutil.rmtree(env_dir)
         code, output = command(argv, workspace, environment, timeout)
         python = env_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
         if not code and python.is_file():
-            return python, output
-    return None, output
+            return python, output, route
+    return None, output, "not-run"
+
+
+def verification_argv(argv: list[str], python: Path) -> list[str]:
+    """Resolve portable Python launchers to the selected verification interpreter."""
+    if argv[0] in {"python", "python3", "python" + str(sys.version_info.major) + "." + str(sys.version_info.minor)}:
+        return [str(python), *argv[1:]]
+    if argv[0] == "py":
+        return [str(python), *argv[2 if argv[:2] == ["py", "-3"] else 1:]]
+    return list(argv)
 
 
 def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int) -> dict:
@@ -977,16 +1002,15 @@ def verify_with_mode(repo: Path, report_dir: Path, scanner: Scanner, manifest: d
         if no_venv:
             python = Path(sys.executable)
         else:
-            python, output = verification_venv(workspace, timeout)
+            python, output, route = verification_venv(workspace, timeout)
+            result["isolation"] = route
             if python is None:
                 scanner.add("verification", "quality", "venv-creation-failed", "release-check.json", value=output)
                 return result
         bin_dir = python.parent
         environment = safe_environment(workspace / "home", bin_dir)
         for step, item in enumerate([*manifest["quickstart"], *manifest["checks"]], 1):
-            argv = item["argv"]
-            if no_venv and (argv[0] in {"python", "python3", "python" + str(sys.version_info.major) + "." + str(sys.version_info.minor)} or argv[:2] == ["py", "-3"]):
-                argv = [str(python), *argv[2 if argv[:2] == ["py", "-3"] else 1:]]
+            argv = verification_argv(item["argv"], python)
             code, output = command(argv, clean, environment, timeout)
             results.append({"step": step, "role": item.get("role", "quickstart"), "exit_code": code, "output_fingerprint": fingerprint(output)})
             if code:
@@ -1085,7 +1109,7 @@ def read_export_audit(target: Path) -> dict | None:
                 or record.get("verdict") not in {"PASS", "FIX-THESE"}
                 or type(record.get("blocking_count")) is not int or record["blocking_count"] < 0
                 or type(record.get("verified")) is not bool
-                or record.get("isolation") not in {"venv", "current-interpreter (less isolated)", "not-run"}
+                or record.get("isolation") not in {"venv", "uv", "virtualenv", "current-interpreter (less isolated)", "not-run"}
                 or (record["verified"] and record["isolation"] == "not-run")
                 or record.get("commit") != git(target, "rev-parse", "HEAD").strip().decode("ascii")
                 or (record["verdict"] == "PASS" and (record["blocking_count"] != 0 or not record["verified"]))):
@@ -1172,7 +1196,7 @@ def build_plan(report: dict, scrub: dict) -> list[dict]:
         add("drop-excluded", "tool", f"Leave out {len(scrub['drop_files'])} tracked files that match the built-in or manifest exclusions.")
     if scrub["not_exported_count"]:
         add("leave-untracked", "tool", f"Leave out {scrub['not_exported_count']} files git does not track. They stay in your folder.")
-    add("drop-history", "tool", f"Discard all history. The export gets one new commit. This removes {scrub['history']['findings']} findings that exist only in old commits, author names or commit messages.")
+    add("drop-history", "tool", f"Discard all history. The export gets one new commit. This removes {scrub['history']['findings']} findings from history and commit metadata; matching working-file content still needs fixing.")
     add("generic-commit", "tool", "Write that commit with a generic author, a UTC date, no remote and no hooks.")
     add("keep-notices", "tool", "Copy license and notice files unchanged. Stop if one from history is missing.")
     blocking = [f for f in target["findings"] if not f["reviewed"]]
@@ -1305,7 +1329,7 @@ def format_text(report: dict) -> str:
         if not target["ready"]:
             lines.append("Export folder: requested destination + .BLOCKED (never publish)")
     verification = target.get("verification", {})
-    lines.append("Verification: " + ("verified" if verification.get("status") == "pass" else "not verified") + " (" + verification.get("isolation", "not-run") + ")")
+    lines.append("Verification: " + ("verified" if verification.get("status") == "pass" else "not verified") + " (" + ("no-venv; " if verification.get("isolation", "").startswith("current-interpreter") else "") + verification.get("isolation", "not-run") + ")")
     locator = report.get("report", "report.json").removesuffix("report.json")
     lines += ["", "REPORT: " + locator + "report.md and report.json, under your reports folder"]
     return ("\n".join(lines) + "\n").encode("ascii", "backslashreplace").decode("ascii")
@@ -1383,7 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"release-check {VERSION}\nVERDICT: {verdict}\n{text}")
             verification_text = "not verified" if unchanged else "not established because the digest does not match"
             if record and record["verified"]:
-                verification_text = "verified (--verify-no-venv; current interpreter, less isolated)" if record["isolation"].startswith("current-interpreter") else "verified (--verify; fresh venv)"
+                verification_text = "verified (--verify-no-venv; current interpreter, less isolated)" if record["isolation"].startswith("current-interpreter") else "verified (--verify; fresh " + record["isolation"] + ")"
             print("Verification: " + verification_text)
             if clean:
                 print(PASS_LIMITATIONS)
@@ -1405,8 +1429,9 @@ def main(argv: list[str] | None = None) -> int:
             target = args.export.expanduser().resolve()
             if target == denylist or target in denylist.parents:
                 raise AuditError("export-contains-denylist")
-            if target.exists() or target.with_name(target.name + ".BLOCKED").exists():
-                raise AuditError("export-destination-exists")
+            blocked = target.with_name(target.name + ".BLOCKED")
+            if any(path.exists() or path.is_symlink() for path in (target, blocked)):
+                raise export_destination_error(target, blocked)
             if target == repo or repo in target.parents:
                 raise AuditError("export-inside-source")
             if target in repo.parents:
@@ -1462,8 +1487,8 @@ def main(argv: list[str] | None = None) -> int:
             export_report["commit"] = git(target, "rev-parse", "HEAD").strip().decode("ascii")
             export_report["audit_record"] = record_export_audit(target, export_report)
             if export_report["ready"]:
-                if requested_target.exists():
-                    raise AuditError("export-destination-exists")
+                if requested_target.exists() or requested_target.is_symlink():
+                    raise export_destination_error(requested_target)
                 target.rename(requested_target)
                 target = requested_target
             export_report["folder_suffix"] = "" if export_report["ready"] else ".BLOCKED"
@@ -1502,7 +1527,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             # A failed report write must not bypass the private error response.
             pass
-        print_error(code, args.json)
+        print_error(code, args.json, error.detail if isinstance(error, AuditError) and code != "audit-incomplete" else None)
         return 2
 
 
