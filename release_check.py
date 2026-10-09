@@ -815,19 +815,27 @@ for d in m.distributions():
  for p in (d.files or []) if any(x in str(p).upper() for x in ('LICENSE','COPYING','NOTICE')) and d.locate_file(p).is_file()]})
 print(json.dumps(out))'''
 
-COMPATIBLE = {"MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "PSF-2.0", "0BSD", "Unlicense", "CC0-1.0", "Python-2.0", "MPL-2.0"}
+COMPATIBLE = {"MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "PSF-2.0", "0BSD", "Unlicense", "CC0-1.0", "Python-2.0", "MPL-2.0", "MIT-CMU", "CNRI-Python", "Zlib", "BSL-1.0", "Apache-2.0 WITH LLVM-exception"}
 CLASSIFIERS = {"MIT License": "MIT", "Apache Software License": "Apache-2.0", "BSD License": "BSD", "ISC License (ISCL)": "ISC", "Python Software Foundation License": "PSF-2.0", "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0"}
+
+
+def compatible_license(label: str | None) -> bool:
+    if not isinstance(label, str):
+        return False
+    parts = re.split(r"\s+(?:AND|OR)\s+", label.strip("()"))
+    return bool(label) and all(p.strip("() ") in COMPATIBLE for p in parts)
 
 
 def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -> dict:
     packages = json.loads(raw)
     count = 0
+    dispositions = []
     for package in packages:
         name = package["name"] or "unknown"
         label = package["expression"]
         if not label:
             text = (package["license"] or "").strip()
-            if text in COMPATIBLE:
+            if compatible_license(text):
                 label = text
             elif "MIT License" in text and "Permission is hereby granted" in text:
                 label = "MIT"
@@ -839,12 +847,21 @@ def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -
         evidence = manifest.get("dependency_licenses", {}).get(name.lower())
         if evidence and isinstance(evidence, dict) and evidence.get("version") == package["version"] and any(evidence.get("sha256") == f["hash"] for f in package["license_files"]):
             label = evidence.get("spdx")
+        disposition = evidence.get("owner_disposition") if isinstance(evidence, dict) else None
+        accepted = (not package["license_files"] and isinstance(disposition, dict)
+                    and evidence.get("version") == package["version"]
+                    and disposition.get("reviewed") is True
+                    and isinstance(disposition.get("source_url"), str) and bool(disposition["source_url"].strip())
+                    and compatible_license(disposition.get("spdx"))
+                    and (compatible_license(label) or (not label and not (package["license"] or "").strip())))
+        if accepted:
+            label = disposition["spdx"]
+            dispositions.append({"package": name, "version": package["version"], "owner_disposition": disposition})
         # Conservative SPDX expression handling: unknown or copyleft branches block.
-        parts = re.split(r"\s+(?:AND|OR)\s+", (label or "").strip("()"))
-        if not label or any(p.strip("() ") not in COMPATIBLE for p in parts) or not package["license_files"]:
+        if not compatible_license(label) or (not package["license_files"] and not accepted):
             scanner.add("verification", "license", "dependency-license-review", "@dependency/" + name, value=json.dumps(package, sort_keys=True))
             count += 1
-    return {"packages": len(packages), "blocked": count}
+    return {"packages": len(packages), "blocked": count, "owner_dispositions": dispositions}
 
 
 def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int) -> dict:
@@ -1125,6 +1142,10 @@ def format_text(report: dict) -> str:
                 lines.append(f"   ... and {len(group) - 10} more in report.md")
             for fix in dict.fromkeys(fix_for(f) for f in group):
                 lines.append("   Fix: " + fix)
+    dispositions = (target.get("verification", {}).get("dependencies") or {}).get("owner_dispositions", [])
+    if dispositions:
+        lines += ["", "OWNER LICENSE DISPOSITIONS (no installed license file)"]
+        lines += ["   " + json.dumps(item, sort_keys=True) for item in dispositions]
     lines += ["", "PLAN"]
     for number, step in enumerate(report.get("plan", []), 1):
         lines.append(f" {number}. [{step['actor']}, {step['status']}] {step['text']}")

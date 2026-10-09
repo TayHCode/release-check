@@ -286,6 +286,14 @@ Dependency license overrides are evidence-bound entries in `dependency_licenses`
 keyed by normalized installed distribution name, with `version`, `spdx` and full
 `sha256` of an installed license file. They clarify ambiguous metadata such as a
 generic BSD classifier; unknown, incompatible or missing evidence still blocks.
+For an installed package with no license file, an entry may instead contain
+`version` and `owner_disposition: {"spdx": "MIT", "source_url": "https://example.org/LICENSE",
+"reviewed": true, "note": "Owner reviewed the upstream license for this version."}`.
+The version must match, the SPDX expression must be allowlisted, and a nonempty
+source URL and explicit review are required. Known incompatible or unknown SPDX
+metadata still blocks. Accepted dispositions and their evidence appear in reports.
+The allowlist includes MIT-CMU, CNRI-Python, Zlib, BSL-1.0 and
+Apache-2.0 WITH LLVM-exception, including conservative AND/OR expressions.
 The policy recognizes permissive/PSF/MPL license identifiers; license obligations
 and source provenance still need human review.
 

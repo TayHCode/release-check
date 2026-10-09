@@ -2,6 +2,12 @@
 
 All notable changes are recorded here, following Keep a Changelog.
 
+## Unreleased (v0.2.1)
+
+- Recognize additional permissive SPDX identifiers and their expressions.
+- Report version-bound, owner-reviewed upstream license dispositions for packages
+  without installed license files. Secret approvals and export digest coverage remain unchanged.
+
 ## 0.2.0 - 2026-10-08
 
 ### Added
