@@ -35,6 +35,7 @@ import unicodedata
 
 VERSION = "0.2.0"
 PASS_LIMITATIONS = "This is not a complete secret scanner. Encoded, split or obfuscated secrets or personal data may be missed, as may unlisted names. Run a dedicated secret scanner too and read the export yourself before publishing."
+BLOCKED_EXPORT_WARNING = "This export is a private review artifact and may still contain credentials or personal data. Do not publish it; delete it after fixing the source, then export to a new folder."
 MEDIA = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mov", ".wav", ".mp3", ".heic"}
 GENERATED = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build"}
 DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "*.env", ".npmrc", "id_rsa*", "id_ed25519*", "id_dsa*", "id_ecdsa*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*token.json", ".git-credentials", ".netrc", ".pgpass", ".htpasswd", "kubeconfig", ".pypirc", "*.jks", "*.keystore", "terraform.tfstate", "*.tfstate", ".docker/config.json", "keystore.properties", ".kube/config"]
@@ -126,7 +127,7 @@ FIXES: dict[str, str] = {
     "historical-attribution-missing": "A license or notice file from history is missing. Restore it.",
     "historical-attribution-changed": "Attribution text from history was removed. Restore the original lines.",
     "missing-document": "Create this file. A README says what the tool does, how to install it, one usage example and its limitations.",
-    "missing-issue-templates": "Add one issue template under .github/ISSUE_TEMPLATE.",
+    "missing-issue-templates": "Add a Markdown issue template (.md) or YAML issue form (.yml or .yaml) under .github/ISSUE_TEMPLATE.",
     "missing-limitations": "Add a README heading that contains \"Limitations\" and say plainly where the tool fails.",
     "missing-tests": "Add at least one test file matching tests/test*.py.",
     "quickstart-not-declared": "List the README install and first-run commands under quickstart in release-check.json.",
@@ -951,9 +952,16 @@ def group_of(finding: dict) -> str:
 
 def fix_for(finding: dict) -> str:
     scope = finding["scope"]
+    if finding["kind"] == "missing-document":
+        return {
+            "CONTRIBUTING.md": "Create CONTRIBUTING.md with instructions for setting up development, running tests and proposing changes.",
+            "SECURITY.md": "Create SECURITY.md with supported versions and a private way to report vulnerabilities.",
+        }.get(finding["path"], FIXES["missing-document"])
     if finding["category"] == "personal" and finding["kind"] != "denylist":
         if finding.get("reviewed"):
             return f'Approval covers only scope "{scope}". Other scopes require separate approvals.'
+        if finding["kind"] == "email" and scope == "metadata" and finding["path"].startswith("@commit/"):
+            return "Git history contains an author or committer email address. Editing working files cannot remove it. Use --export to make a one-commit copy with generic authorship, then scan and verify that copy. Keep the original history private; do not approve a real personal address just to pass."
         approval = f'This finding still lacks approval in scope "{scope}". A deliberate public example needs an approval for this scope in release-check.json.'
         return approval + " " + (HISTORY_FIX if scope in {"history", "metadata"} else FIXES[finding["kind"]])
     if finding["scope"] in {"history", "metadata"} and finding["category"] in {"personal", "secrets"}:
@@ -1125,6 +1133,8 @@ def format_text(report: dict) -> str:
         lines.append(PASS_LIMITATIONS)
     lines += ["Judged: " + ("the export (one commit, no history)" if "export" in report else "the source repository"),
               f"Blocking: {len(classified['blocking'])}   Warnings: {len(classified['warnings'])}"]
+    if "export" in report and not target["ready"]:
+        lines.append("WARNING: " + BLOCKED_EXPORT_WARNING)
     stats = report.get("stats", {})
     lines.append(f"Scanned: {stats.get('tree_files', 0)} working files, {stats.get('history_commits', 0)} commits")
     if report.get("scrub_plan", {}).get("working_changes"):
@@ -1227,7 +1237,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 unchanged = False
             verdict = "PASS" if unchanged else "FIX-THESE"
-            text = "The export is unchanged since it was scanned." if unchanged else "The export changed or is not a single clean commit. Export again."
+            text = "The export is unchanged since it was scanned." if unchanged else "The export changed or is not a single clean commit. File contents, modes and modification times are part of the digest, as is Git metadata. Restoring bytes alone may not restore the digest. Export again into a new folder."
             print(f"release-check {VERSION}\nVERDICT: {verdict}\n{text}")
             if unchanged:
                 print(PASS_LIMITATIONS)
@@ -1309,6 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
         if "export" in report:
             summary["export_ready"] = report["export"]["ready"]
             summary["export_counts"] = report["export"]["counts"]
+            if not report["export"]["ready"]:
+                summary["export_warning"] = BLOCKED_EXPORT_WARNING
         # Only the relative report locator is printed (home names stay private).
         summary["report"] = name + "/" + stamp + "/report.json"
         if args.json:

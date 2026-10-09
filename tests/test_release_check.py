@@ -93,6 +93,71 @@ class AuditTests(unittest.TestCase):
         self.assertNotIn("sample.txt:11 ", text)
         self.assertIn("| sample.txt | 12 |", rc.format_markdown(report))
 
+    def test_commit_author_email_gets_export_guidance_not_example_approval(self):
+        address = "author@" + "example.com"
+        self.git("-c", "user.name=Sample Author", "-c", "user.email=" + address,
+                 "commit", "--allow-empty", "-qm", "Author fixture")
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 1, err)
+        finding = next(f for f in self.latest_report()["findings"]
+                       if f["kind"] == "email" and f["path"].startswith("@commit/"))
+        fix = rc.fix_for(finding)
+        for text in ("author or committer email", "--export", "generic authorship", "original history private"):
+            self.assertIn(text, fix)
+        self.assertNotIn("deliberate public example", fix)
+        self.assertNotIn(address, out)
+
+    def test_missing_documents_have_their_own_fix_instructions(self):
+        for name in ("CONTRIBUTING.md", "SECURITY.md"):
+            (self.repo / name).unlink()
+        shutil.rmtree(self.repo / ".github/ISSUE_TEMPLATE")
+        code, out, err = self.run_cli()
+        self.assertEqual(code, 1, err)
+        self.assertIn("Create CONTRIBUTING.md with instructions", out)
+        self.assertIn("Create SECURITY.md with supported versions", out)
+        self.assertIn("Markdown issue template (.md) or YAML issue form (.yml or .yaml)", out)
+        self.assertNotIn("A README says", out)
+
+    def test_blocked_export_warns_that_copied_content_is_still_private(self):
+        token = "gh" + "p_" + "A" * 30
+        (self.repo / "config.py").write_text(token)
+        self.git("add", "--", "config.py")
+        target = self.root / "blocked-export"
+        code, out, err = self.run_cli("--export", str(target))
+        self.assertEqual(code, 1, err)
+        self.assertEqual((target / "config.py").read_text(), token)
+        self.assertIn("WARNING: " + rc.BLOCKED_EXPORT_WARNING, out)
+        self.assertIn(rc.BLOCKED_EXPORT_WARNING, (next((self.root / "reports").rglob("report.md"))).read_text())
+        self.assertNotIn(token, out)
+        code, out, err = self.run_cli("--json", "--export", str(self.root / "json-export"))
+        self.assertEqual(code, 1, err)
+        self.assertFalse(json.loads(out)["export_ready"])
+        self.assertEqual(json.loads(out)["export_warning"], rc.BLOCKED_EXPORT_WARNING)
+
+    def test_passing_export_has_no_blocked_export_warning(self):
+        code, out, err = self.run_cli("--verify", "--export", str(self.root / "passing-export"))
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn(rc.BLOCKED_EXPORT_WARNING, out)
+        code, out, err = self.run_cli("--json", "--verify", "--export", str(self.root / "passing-json-export"))
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("export_warning", json.loads(out))
+
+    def test_digest_failure_explains_file_times_even_when_bytes_match(self):
+        target = self.root / "export"
+        rc.copy_tree(self.repo, target, self.manifest, self.scan())
+        digest = rc.export_digest(target)
+        readme = target / "README.md"
+        before = readme.stat()
+        os.utime(readme, ns=(before.st_atime_ns, before.st_mtime_ns + 1000000000))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = rc.main([str(target), "--check-digest", digest])
+        self.assertEqual(code, 1)
+        for text in ("modification times", "Restoring bytes alone", "new folder"):
+            self.assertIn(text, out.getvalue())
+        os.utime(readme, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(rc.export_digest(target), digest)
+
     def test_text_verdict_pass_for_clean_export(self):
         code, out, err = self.run_cli("--verify", "--export", str(self.root / "export"))
         self.assertEqual(code, 0, out + err)
@@ -112,7 +177,7 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(set(json.loads(first)), {"ready", "counts", "report"})
         self.assertIn("drop_files", json.loads(remainder))
         code, out, err = self.run_cli("--json", "--export", str(self.root / "export"))
-        self.assertEqual(set(json.loads(out)), {"ready", "counts", "report", "export_ready", "export_counts"})
+        self.assertEqual(set(json.loads(out)), {"ready", "counts", "report", "export_ready", "export_counts", "export_warning"})
 
     def test_history_findings_are_warnings_when_exporting(self):
         self.private_history()

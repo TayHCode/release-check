@@ -168,6 +168,23 @@ The terms file is mandatory for auditing and is never copied into an export.
 
 ## The three steps
 
+Before aiming for PASS, your repository needs:
+
+- `LICENSE` with the standard MIT text and the correct copyright holder;
+  declared license metadata must agree. Other licenses need manual review and
+  do not pass this tool's MIT policy automatically.
+- `README.md` describing setup and use, with a heading containing
+  `limitations`, `known issues` or `where it fails`.
+- `CONTRIBUTING.md` for development, tests and contribution instructions, and
+  `SECURITY.md` for supported versions and private vulnerability reporting.
+- At least one `.md`, `.yml` or `.yaml` issue template under
+  `.github/ISSUE_TEMPLATE`, and a `test*.py` file under `tests`.
+- `release-check.json` declaring an exact README quickstart and a check with
+  `role: tests`. Also declare lint/type checks when Ruff/mypy is configured.
+
+The document checks test presence and the limitations heading; they do not
+judge the completeness of contribution instructions or validate issue forms.
+
 1. Audit: `release-check REPO`.
 2. Fix every item under BLOCKING, then run the audit again. Keep the source private.
 3. Build and verify an export: `release-check REPO --verify --export NEW_DIR`.
@@ -193,11 +210,18 @@ Every unreviewed finding in the judged target blocks. A warning is either an exa
 finding you acknowledged in the manifest, or a finding found only in the private
 source when the export is being judged. Without an export, old-commit findings
 still block. The original repository can remain blocked while its export passes.
+In particular, a real author or committer email in Git history is expected to
+block a source audit. Editing the README cannot remove it. A one-commit export
+replaces authorship with a generic identity; keep the original history private
+and verify the export. Do not approve a real personal address to silence the gate.
 
 Use `--json` for scripts: the first line retains the `ready`, `counts` and `report`
 summary, with `export_ready` and `export_counts` when exporting. In that mode,
 `--scrub-plan` adds a second JSON document. The saved reports always include the
 verdict, plan and test list. Error JSON includes a fixed `code`, never the argument.
+Blocked exports also include `export_warning` in the JSON summary and a warning
+in the readable verdict. Each group shows up to ten locations in the terminal;
+`report.md` and `report.json` retain every finding.
 
 ## The scrub plan
 
@@ -251,7 +275,9 @@ no active hooks and no original history. It is scanned again, including its new
 commit and all license and quality checks. `--verify` also verifies the export.
 A blocked export is a **private review artifact**. A failed or interrupted export
 can leave a partial directory. Keep it private and use a new destination on retry;
-existing paths are never overwritten.
+existing paths are never overwritten. A blocked export can still contain the
+reported credentials or personal data. Do not publish it; delete it after fixing
+the source, then export again to a new folder.
 
 The report records the export commit, file count and SHA-256 digest. Immediately
 before publishing, and **before adding a remote**, run:
@@ -426,7 +452,9 @@ spaced letters, homoglyphs, leetspeak, base64-encoded terms, split strings and
 computed credentials are not decoded. UTF-32 text is not interpreted.
 
 False positives are expected, including machine-shaped identifiers, loopback
-addresses, version strings, phone-shaped identifiers and 32-hex digests.
+addresses, placeholder email addresses at example domains, version strings,
+phone-shaped identifiers and 32-hex digests. Deliberate public examples need
+exact scope/path/fingerprint approvals; these domains are not blanket exemptions.
 Entropy cannot identify every secret.
 The tool does not OCR images, recognize faces, unpack archives, discover nonlocal
 Git refs or audit unreachable source objects, or inspect anything on the hosting site. It never
