@@ -127,7 +127,9 @@ class AuditTests(unittest.TestCase):
         target = self.root / "blocked-export"
         code, out, err = self.run_cli("--export", str(target))
         self.assertEqual(code, 1, err)
-        self.assertEqual((target / "config.py").read_text(), token)
+        self.assertFalse(target.exists())
+        self.assertEqual((target.with_name(target.name + ".BLOCKED") / "config.py").read_text(), token)
+        self.assertNotIn("VERDICT: PASS", out)
         self.assertIn("WARNING: " + rc.BLOCKED_EXPORT_WARNING, out)
         self.assertIn(rc.BLOCKED_EXPORT_WARNING, (next((self.root / "reports").rglob("report.md"))).read_text())
         self.assertNotIn(token, out)
@@ -558,6 +560,7 @@ class AuditTests(unittest.TestCase):
         code, out, err = self.run_cli("--export", str(target))
         self.assertEqual(code, 1, out + err)
         export = self.latest_report()["export"]
+        target = target.with_name(target.name + ".BLOCKED")
         h = hashlib.sha256()
         for raw in sorted(filter(None, rc.git(target, "ls-files", "-z").split(b"\0"))):
             file = target / os.fsdecode(raw)
@@ -586,7 +589,7 @@ class AuditTests(unittest.TestCase):
                 target = self.root / mutation
                 rc.copy_tree(self.repo, target, self.manifest, rc.Scanner(self.terms))
                 digest = rc.export_digest(target)
-                check(target, digest, 0)
+                check(target, digest, 1)  # A raw copy has no recorded audit and cannot pass.
                 check(target, "0" * 64, 1)
                 check(target, "invalid", 2)
                 if mutation == "edit":

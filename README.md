@@ -65,16 +65,23 @@ python3 --version
 python3 release_check.py --help
 ```
 
-On macOS, the system `python3` may be 3.9. Get a newer Python from
-[python.org](https://www.python.org/downloads/macos/), Homebrew
-(`brew install python@3.11`), or uv. With Homebrew, use `python3.11` in place of
-`python3` throughout this README. With uv, run
-`uv run --no-project --python 3.11 python release_check.py --help`;
-replace `--help` with your audit arguments. These options can also supply a
-Python with working venv support for `--verify`.
-If Homebrew's Python is not on your PATH, its usual executable is
-`/opt/homebrew/bin/python3.11` on Apple silicon or `/usr/local/bin/python3.11`
-on Intel Macs; use that path in place of `python3`.
+On stock macOS, system `python3` is often 3.9.6 and cannot run this tool.
+The shortest no-admin route to a usable Python 3.12 is the
+[official uv installer](https://docs.astral.sh/uv/getting-started/installation/):
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+. "$HOME/.local/bin/env"
+uv run --no-project --python 3.12 python release_check.py --help
+```
+
+Replace `--help` with your audit arguments. uv downloads Python 3.12 into your
+home; this Python also supplies working venv support. This route works on Linux
+without administrator access too. Alternatively install from
+[python.org](https://www.python.org/downloads/macos/) or use
+`brew install python@3.12`, then use `python3.12` throughout this README.
+If Homebrew's Python is not on PATH, use `/opt/homebrew/bin/python3.12` on Apple
+silicon or `/usr/local/bin/python3.12` on Intel Macs.
 
 On Windows, use PowerShell and the Python launcher:
 
@@ -112,7 +119,8 @@ release-check --help
 
 If PowerShell's policy prevents activation, invoke `.\.venv\Scripts\python.exe`
 and `.\.venv\Scripts\release-check.exe` directly; activation is optional.
-A working venv with pip is needed for the optional package install and `--verify`.
+A working venv with pip is needed for the optional package install. `--verify`
+tries the current Python's `venv`, then `uv venv --seed`, then `virtualenv`.
 On Debian/Ubuntu, a missing `ensurepip` usually means the matching `python3-venv`
 package (or a versioned package such as `python3.11-venv`) is absent. Ask your
 administrator to install it, or use a supported Python from python.org or uv.
@@ -193,7 +201,8 @@ judge the completeness of contribution instructions or validate issue forms.
 3. Build and verify an export: `release-check REPO --verify --export NEW_DIR`.
 
 Replace `REPO` with the repository root and `NEW_DIR` with a new path outside it.
-Then finish the test list and publish the export folder by hand.
+Publish the export folder by hand only after a clean export verdict, a PASS from
+`--check-digest`, the manual test list and owner approval.
 
 ## Reading the verdict
 
@@ -214,8 +223,10 @@ finding you acknowledged in the manifest, or a finding found only in the private
 source when the export is being judged. Without an export, old-commit findings
 still block. The original repository can remain blocked while its export passes.
 In particular, a real author or committer email in Git history is expected to
-block a source audit. Editing the README cannot remove it. A one-commit export
-replaces authorship with a generic identity; keep the original history private
+block a source audit. Editing the README cannot remove it. Locations identify the commit and its author/committer metadata; `.git/config`
+means the local Git configuration, not a tracked source file. Those identity
+findings share one fix. A one-commit export
+replaces authorship with a generic identity and removes source Git config; keep the original history private
 and verify the export. Do not approve a real personal address to silence the gate.
 
 Use `--json` for scripts: the first line retains the `ready`, `counts` and `report`
@@ -249,11 +260,23 @@ Automatic items correspond to each declared quickstart command and check, with
 `passed`, `failed` or `not run` taken from its actual execution result. Commands
 are identified by position and role; their arguments and output are never printed.
 Run with `--verify` to execute them in a clean clone with a fresh HOME and venv.
-Verification needs Python 3.11+ and a working `venv` with `ensurepip`/pip on the
-machine running it. On Debian/Ubuntu without that package, the run stops with
-`venv-creation-failed`, explains the `python3-venv` remedy and leaves every
-quickstart and test item `not run`. A direct audit can still run. Use the supported
-Python alternatives in Quickstart if you cannot install system packages.
+Verification needs Python 3.11+. It tries `python -m venv`, then `uv venv`
+(with pip seeded) if uv is on PATH, then `virtualenv` if available. If all fail,
+`venv-creation-failed` names the OS-specific fix and the no-admin uv route above;
+quickstart and tests remain `not run`. On Debian/Ubuntu the administrator fix is
+`sudo apt install python3-venv` (use the matching versioned package if needed).
+On macOS use `brew install python@3.12`; on Windows use
+`winget install --exact --id Python.Python.3.12`.
+
+For a project whose declared commands need only Python's standard library, set
+`"stdlib_only": true` in its manifest and run `--verify-no-venv` instead of
+`--verify`. This still runs the exact declared commands in a fresh clone with a
+clean HOME and the current interpreter, and labels the result **less isolated**.
+Python launchers (`python`, `python3`, `py -3`) select that current interpreter.
+This is an explicit owner declaration, not dependency inference. Do not use it
+for commands that install or import third-party packages. Declared dependencies
+and optional dependencies are rejected; dependency metadata is not audited in
+this mode. The tool's own install quickstart requires ordinary `--verify`.
 Windows verification uses the venv's `Scripts` directory and isolated Windows
 profile/temp folders; Linux and macOS use `bin`. Declared commands must be
 available in that fresh environment, rather than only in your personal PATH.
@@ -284,11 +307,12 @@ These are still scanned in the source, but are left out of the export.
 The copy gets one commit with a generic author and committer, a UTC date, no remote,
 no active hooks and no original history. It is scanned again, including its new
 commit and all license and quality checks. `--verify` also verifies the export.
-A blocked export is a **private review artifact**. A failed or interrupted export
-can leave a partial directory. Keep it private and use a new destination on retry;
-existing paths are never overwritten. A blocked export can still contain the
-reported credentials or personal data. Do not publish it; delete it after fixing
-the source, then export again to a new folder.
+An export starts in `DIR.BLOCKED`, a **private review artifact**. Only a clean
+verified audit moves it to the requested `DIR`. A blocked, failed or interrupted
+run leaves only `DIR.BLOCKED` and never prints PASS. A loud warning identifies
+this folder: it can contain the reported credentials or personal data. Do not
+publish it. Delete it after fixing the source, then export again to a new folder;
+existing requested or `.BLOCKED` paths are never overwritten.
 
 The report records the export commit, file count and SHA-256 digest. Immediately
 before publishing, and **before adding a remote**, run:
@@ -298,8 +322,12 @@ release-check EXPORT_DIR --check-digest DIGEST
 ```
 
 Use the digest from the report. This needs no terms file and writes no report.
-An unchanged export returns PASS (0); a changed or unclean export returns
-FIX-THESE (1); a malformed digest, missing path or non-Git folder returns
+PASS (0) means **DIGEST MATCHES AND THE EXPORT IS CLEAN**: the recorded audit
+was PASS with zero blocking findings and completed verification. Integrity alone
+is insufficient. An unchanged blocked export says **DIGEST MATCHES BUT THE
+EXPORT WAS NOT CLEAN: N blocking findings (FIX-THESE)** and exits 1. The output
+also says whether `--verify` ran or the less isolated `--verify-no-venv` was used.
+A missing/invalid audit record or a changed export returns FIX-THESE (1); a malformed digest, missing path or non-Git folder returns
 INCOMPLETE (2) with a reason.
 
 The digest requires one reachable commit across all refs and one on HEAD, exactly
@@ -309,7 +337,14 @@ extra branch or custom ref invalidates it, even if no new commit was added.
 The export's `.git/config` must retain exactly the generated core settings
 (`repositoryformatversion=0`, `filemode=true`, `bare=false`, `logallrefupdates=true`),
 with no edits or additions. Exports contain no hooks, including sample hooks.
+The export-time audit record `.git/release-check-audit.json` contains the audit
+verdict, blocker count, verification/isolation status and export commit. It is
+covered by the digest along with all other metadata. Older exports without that
+record can never pass `--check-digest`; export them again with verification.
+Keep the digest from the original private report; substituting a newly computed
+digest does not establish that the original export was clean.
 The exact metadata file whitelist is HEAD, config, description, index,
+release-check-audit.json,
 info/exclude, refs/heads/main, logs/HEAD, logs/refs/heads/main and the loose
 objects reachable from the single commit. Other files, symlinks, packs,
 alternates, shallow metadata, grafts and attributes invalidate the check.
@@ -335,7 +370,11 @@ does not set Unix execute bits, so that Unix-only change cannot be tested there.
 `release-check.json` declares exclusions and commands. `--manifest PATH` can use
 an external private manifest instead. `--verify` authorizes those reviewed commands;
 without it, readiness remains blocked. No commands are inferred from README prose.
-`argv` avoids shell interpretation.
+`argv` avoids shell interpretation. Commands are per-OS: use `python` or `py -3`
+in Windows manifests and match the README line exactly. JSON manifests and
+private terms files must be UTF-8; a UTF-8 BOM (including PowerShell 5.1
+`Set-Content -Encoding utf8`) is accepted silently. Other encodings receive a
+specific encoding error; malformed JSON receives a schema error.
 A missing or malformed `--manifest` file returns INCOMPLETE (2); a malformed
 in-repository `release-check.json` does too. An external manifest is not copied
 into the export as `release-check.json`. Keep it available and pass `--manifest`
