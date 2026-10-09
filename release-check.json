@@ -75,7 +75,7 @@
   "quickstart": [
     {
       "file": "README.md",
-      "line": 97,
+      "line": 100,
       "argv": [
         "python",
         "-m",
@@ -86,7 +86,7 @@
     },
     {
       "file": "README.md",
-      "line": 98,
+      "line": 101,
       "argv": [
         "release-check",
         "--help"

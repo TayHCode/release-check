@@ -24,6 +24,8 @@ class AuditTests(unittest.TestCase):
         self.denylist.write_text(json.dumps({"categories": {"family": {"placeholder": "private", "terms": ["HiddenPerson"]}}}))
         self.terms = rc.load_terms(self.denylist)
         self.git("init", "-q", "-b", "main")
+        # Match the auditor's isolated Git settings, including on Windows.
+        self.git("config", "core.autocrlf", "false")
         self.git("config", "user.name", "Fixture contributors")
         self.git("config", "user.email", "fixture")
         shutil.copyfile(Path(rc.__file__).with_name("LICENSE"), self.repo / "LICENSE")
@@ -605,7 +607,10 @@ class AuditTests(unittest.TestCase):
                     commit = rc.git(target, "-c", "user.name=Example", "-c", "user.email=example", "commit-tree", tree, "-m", "Separate").strip().decode()
                     rc.git(target, "tag", "extra", commit)
                 elif mutation == "mode":
+                    before = (target / "README.md").stat().st_mode & 0o111
                     (target / "README.md").chmod(0o700)
+                    if (target / "README.md").stat().st_mode & 0o111 == before:
+                        self.skipTest("This filesystem does not support changing Unix execute bits")
                 elif mutation == "config":
                     rc.git(target, "config", "user.name", "Example")
                 elif mutation == "hook":
@@ -822,8 +827,9 @@ class AuditTests(unittest.TestCase):
         reports = list((self.root / "reports").rglob("report.*"))
         self.assertEqual(len(reports), 2)
         for p in reports:
-            self.assertEqual(p.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(p.parent.stat().st_mode & 0o777, 0o700)
+            if os.name != "nt":
+                self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(p.parent.stat().st_mode & 0o777, 0o700)
             self.assertNotIn(secret, p.read_text())
         report = json.loads(next(p for p in reports if p.suffix == ".json").read_text())
         self.assertGreater(report["counts"]["secrets"], 0)
@@ -1040,6 +1046,45 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["commands"][-1]["exit_code"], 3)
         self.assertNotIn(secret, json.dumps(result) + json.dumps(scanner.findings))
+
+    def test_missing_venv_support_explains_remedy_and_runs_no_steps(self):
+        scanner = rc.Scanner(self.terms)
+        with patch.object(rc, "command", return_value=(1, b"ensurepip unavailable")):
+            result = rc.verify(self.repo, self.root, scanner, self.manifest, 30)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["commands"], [])
+        finding = next(f for f in scanner.findings if f["kind"] == "venv-creation-failed")
+        for text in ("python3-venv", "uv", "did not execute the quickstart or tests"):
+            self.assertIn(text, rc.fix_for(finding))
+
+    def test_missing_declared_executable_is_a_blocker_with_plain_guidance(self):
+        scanner = rc.Scanner(self.terms)
+        manifest = {**self.manifest, "checks": [{"role": "tests", "argv": ["missing-fixture-program"]}]}
+        result = rc.verify(self.repo, self.root, scanner, manifest, 30)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual([step["exit_code"] for step in result["commands"]], [0, 127])
+        finding = next(f for f in scanner.findings if f["kind"] == "command-not-found")
+        self.assertIn("earlier quickstart step", rc.fix_for(finding))
+
+    def test_command_exit_127_is_not_misreported_as_missing_executable(self):
+        scanner = rc.Scanner(self.terms)
+        manifest = {**self.manifest, "checks": [{"role": "tests", "argv": ["python", "-c", "raise SystemExit(127)"]}]}
+        result = rc.verify(self.repo, self.root, scanner, manifest, 30)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["commands"][-1]["exit_code"], 127)
+        self.assertIn("command-failed", {f["kind"] for f in scanner.findings})
+        self.assertNotIn("command-not-found", {f["kind"] for f in scanner.findings})
+
+    def test_verification_uses_fresh_python_and_profile_not_parent_environment(self):
+        import shlex
+        script = "import os,sys; assert sys.prefix != sys.base_prefix; assert os.environ['HOME'] == os.environ['TEMP']; assert 'SAMPLE_PRIVATE_VALUE' not in os.environ"
+        (self.repo / "README.md").write_text("# Sample\n## Limitations\nSynthetic only.\npython -c " + shlex.quote(script) + "\n")
+        manifest = {**self.manifest, "quickstart": [{"file": "README.md", "line": 4, "argv": ["python", "-c", script]}]}
+        scanner = rc.Scanner(self.terms)
+        with patch.dict(os.environ, {"SAMPLE_PRIVATE_VALUE": "never-inherit"}):
+            result = rc.verify(self.repo, self.root, scanner, manifest, 30)
+        self.assertEqual(result["status"], "pass", scanner.findings)
+        self.assertEqual([step["exit_code"] for step in result["commands"]], [0, 0])
 
     def test_command_timeout_kills_process_and_blocks(self):
         code, output = rc.command([sys.executable, "-c", "import time;time.sleep(30)"], self.repo, rc.safe_environment(self.root / "home", Path(sys.executable).parent), 1)

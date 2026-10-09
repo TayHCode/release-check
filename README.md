@@ -72,6 +72,9 @@ On macOS, the system `python3` may be 3.9. Get a newer Python from
 `uv run --no-project --python 3.11 python release_check.py --help`;
 replace `--help` with your audit arguments. These options can also supply a
 Python with working venv support for `--verify`.
+If Homebrew's Python is not on your PATH, its usual executable is
+`/opt/homebrew/bin/python3.11` on Apple silicon or `/usr/local/bin/python3.11`
+on Intel Macs; use that path in place of `python3`.
 
 On Windows, use PowerShell and the Python launcher:
 
@@ -246,6 +249,14 @@ Automatic items correspond to each declared quickstart command and check, with
 `passed`, `failed` or `not run` taken from its actual execution result. Commands
 are identified by position and role; their arguments and output are never printed.
 Run with `--verify` to execute them in a clean clone with a fresh HOME and venv.
+Verification needs Python 3.11+ and a working `venv` with `ensurepip`/pip on the
+machine running it. On Debian/Ubuntu without that package, the run stops with
+`venv-creation-failed`, explains the `python3-venv` remedy and leaves every
+quickstart and test item `not run`. A direct audit can still run. Use the supported
+Python alternatives in Quickstart if you cannot install system packages.
+Windows verification uses the venv's `Scripts` directory and isolated Windows
+profile/temp folders; Linux and macOS use `bin`. Declared commands must be
+available in that fresh environment, rather than only in your personal PATH.
 
 Manual items always remain `to do`. Repeat the README on another machine or user
 account, confirm the license holder and hosting-site fields, and publish the export
@@ -316,6 +327,8 @@ The export digest is SHA-256 of the ASCII HEAD object ID, NUL, then the inner
 hexadecimal digest encoded as ASCII. No newline is included. This hashes working
 bytes, metadata and the commit identity together. Touching files, refreshing the
 index or repacking objects changes the digest; check the original export folder.
+Execute bits are checked as reported by the host filesystem. Windows `chmod`
+does not set Unix execute bits, so that Unix-only change cannot be tested there.
 
 ## Manifest and verification
 
@@ -350,8 +363,10 @@ A missing document or a mismatch blocks verification before commands run.
 Roles are `quickstart`, `tests`, `lint`, `types`, `build` and `syntax`.
 
 Verification snapshots the tracked working files, clones the snapshot and creates
-a fresh venv and HOME without inherited credentials. The first commands must
-install the project and required test tools. Each command's exit code and output
+a fresh venv and HOME without inherited credentials. For a packaged project with
+`pyproject.toml`, the first commands must install the project and required test
+tools. A standard-library script without packaging can declare its direct
+first-run command instead. Each command's exit code and output
 fingerprint are recorded; raw output is discarded. `--timeout` bounds each command
 (default 300 seconds). Pip may contact package indexes.
 
@@ -433,7 +448,9 @@ public and private URLs look the same without that evidence.
 ## Reports and privacy
 
 Exactly two files, `report.json` and `report.md`, are written under
-`<report-root>/<repo>/<UTC-timestamp>/`, with a 0700 run directory and 0600 files.
+`<report-root>/<repo>/<UTC-timestamp>/`, with a 0700 run directory and 0600 files
+on POSIX systems. Windows privacy depends on directory ACLs, which this tool
+does not change; choose a reports root restricted to your account.
 The reports hold counts, statuses, safe relative paths, line numbers, term indices,
 object IDs and SHA-256 fingerprints (first 16 hex characters). Private filenames
 become path fingerprints. No matched content, command output or terms are included.
@@ -472,6 +489,9 @@ Fresh HOME/venv isolates credentials and caches; it is not a security sandbox.
 Only verify repositories and commands you trust: their code can access the machine
 and network. Browser, account, hardware and deployment checks stay manual.
 The tool starts no services or timers itself.
+
+Roadmap: an optional `--on` could repeat the declared quickstart on multiple
+machines. It is not implemented; repeat the README on each machine manually today.
 
 ## Related tools
 

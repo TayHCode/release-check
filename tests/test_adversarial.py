@@ -7,6 +7,7 @@ from pathlib import Path
 import random
 import shutil
 import string
+import tempfile
 import unittest
 
 import release_check as rc
@@ -232,7 +233,8 @@ class ExportRegressions(unittest.TestCase):
                  'worktrees/x/gitdir', 'lfs/x', 'info/sparse-checkout', 'objects/pack/extra']
         for name in paths + ['reflog', 'detached', 'loose', 'pack', 'empty-dir', 'index', 'touch', 'hook-symlink']:
             with self.subTest(name=name):
-                target = self.root / 'mutation'
+                temporary = tempfile.TemporaryDirectory(dir=self.root)
+                target = Path(temporary.name) / 'mutation'
                 shutil.copytree(base, target)
                 try:
                     if name in paths:
@@ -266,7 +268,8 @@ class ExportRegressions(unittest.TestCase):
                     with redirect_stdout(io.StringIO()):
                         self.assertEqual(rc.main([str(target), '--check-digest', digest]), 1)
                 finally:
-                    shutil.rmtree(target)
+                    # TemporaryDirectory handles read-only Git objects on Windows.
+                    temporary.cleanup()
         self.assertEqual(rc.export_digest(base), digest)
 
     def test_ref_tagger_and_remote_metadata(self):

@@ -36,6 +36,7 @@ import unicodedata
 VERSION = "0.2.0"
 PASS_LIMITATIONS = "This is not a complete secret scanner. Encoded, split or obfuscated secrets or personal data may be missed, as may unlisted names. Run a dedicated secret scanner too and read the export yourself before publishing."
 BLOCKED_EXPORT_WARNING = "This export is a private review artifact and may still contain credentials or personal data. Do not publish it; delete it after fixing the source, then export to a new folder."
+MISSING_EXECUTABLE_OUTPUT = b"Declared executable was not found in the verification environment."
 MEDIA = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mov", ".wav", ".mp3", ".heic"}
 GENERATED = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build"}
 DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "*.env", ".npmrc", "id_rsa*", "id_ed25519*", "id_dsa*", "id_ecdsa*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*token.json", ".git-credentials", ".netrc", ".pgpass", ".htpasswd", "kubeconfig", ".pypirc", "*.jks", "*.keystore", "terraform.tfstate", "*.tfstate", ".docker/config.json", "keystore.properties", ".kube/config"]
@@ -137,7 +138,8 @@ FIXES: dict[str, str] = {
     "verification-not-run": "Run again with --verify to execute the declared commands in a clean clone.",
     "quickstart-document-mismatch": "The command in release-check.json differs from that line of the document. Make them identical.",
     "quickstart-document-missing": "The document named in the quickstart entry does not exist. Create it or correct the entry.",
-    "venv-creation-failed": "Python could not create a virtual environment. Install venv support and run again.",
+    "venv-creation-failed": "Verification could not create a fresh virtual environment with pip. On Debian/Ubuntu, install the matching python3-venv package (sometimes a versioned package such as python3.11-venv), or use a supported Python from python.org or uv with venv/ensurepip. Direct-script audits still work. This run did not execute the quickstart or tests.",
+    "command-not-found": "A declared executable was not found in the fresh verification environment. Install the required tool in an earlier quickstart step, or correct the command in release-check.json.",
     "command-failed": "A declared command failed in the clean clone. Run it yourself in a fresh clone to see why.",
     "project-not-installed": "The quickstart did not install the project. Make the first quickstart command install it.",
     "export-content-mismatch": "A file changed while it was being exported. Export again into a new folder.",
@@ -754,7 +756,7 @@ def export_digest(target: Path) -> str:
                 raise AuditError("export-not-clean")
         objects = {"objects/" + oid[:2] + "/" + oid[2:] for oid in git(target, "rev-list", "--objects", "--no-object-names", "--all").decode().splitlines()}
         allowed_files = fixed | objects
-        allowed_dirs = {"hooks", "info", "objects", "objects/info", "objects/pack", "refs", "refs/heads", "refs/tags", "logs", "logs/refs", "logs/refs/heads"} | {str(Path(p).parent) for p in objects}
+        allowed_dirs = {"hooks", "info", "objects", "objects/info", "objects/pack", "refs", "refs/heads", "refs/tags", "logs", "logs/refs", "logs/refs/heads"} | {Path(p).parent.as_posix() for p in objects}
         if {r for r, p in entries.items() if p.is_file()} != allowed_files or {r for r, p in entries.items() if p.is_dir()} != allowed_dirs:
             raise AuditError("export-not-clean")
         if git(target, "fsck", "--full", "--strict", "--unreachable", "--no-reflogs").strip():
@@ -775,7 +777,7 @@ def export_digest(target: Path) -> str:
             raise AuditError("export-not-clean")
         content = hashlib.sha256()
         tracked = sorted(p for p in git(target, "ls-files", "-z").split(b"\0") if p)
-        expected_dirs = {str(parent) for raw in tracked for parent in Path(os.fsdecode(raw)).parents if str(parent) != "."}
+        expected_dirs = {parent.as_posix() for raw in tracked for parent in Path(os.fsdecode(raw)).parents if str(parent) != "."}
         actual_dirs = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_dir() and ".git" not in p.relative_to(target).parts}
         if actual_dirs != expected_dirs:
             raise AuditError("export-not-clean")
@@ -796,17 +798,41 @@ def export_digest(target: Path) -> str:
 def safe_environment(home: Path, bin_dir: Path) -> dict:
     # Credentials, Git config, application caches and provider opt-ins do not inherit.
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return {"HOME": str(home), "TMPDIR": str(home), "PATH": str(bin_dir) + os.pathsep + "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
+    paths = [str(bin_dir)]
+    git_executable = shutil.which("git")
+    if git_executable:
+        paths.append(str(Path(git_executable).parent))
+    environment = {"HOME": str(home), "TMPDIR": str(home), "TEMP": str(home), "TMP": str(home), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
+    if sys.platform == "win32":
+        system_root = os.environ.get("SystemRoot", os.environ.get("WINDIR", ""))
+        if system_root:
+            environment.update(SystemRoot=system_root, WINDIR=system_root)
+            paths.extend([str(Path(system_root) / "System32"), system_root])
+        environment.update(USERPROFILE=str(home), APPDATA=str(home / "AppData/Roaming"), LOCALAPPDATA=str(home / "AppData/Local"), PATHEXT=".COM;.EXE;.BAT;.CMD")
+    else:
+        paths.extend(["/usr/local/bin", "/usr/bin", "/bin"])
+    environment["PATH"] = os.pathsep.join(dict.fromkeys(paths))
+    return environment
 
 
 def command(argv: list[str], cwd: Path, env: dict, timeout: int) -> tuple[int, bytes]:
     # A timeout kills the process group, including any subprocess the test spawned.
     with tempfile.TemporaryFile() as output:
-        process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        # Windows otherwise searches the parent's PATH when creating a process.
+        executable = shutil.which(argv[0], path=env.get("PATH", ""))
+        if executable is None:
+            return 127, MISSING_EXECUTABLE_OUTPUT
+        process = subprocess.Popen([executable, *argv[1:]], cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
+            if sys.platform == "win32":
+                taskkill = Path(env["SystemRoot"]) / "System32/taskkill.exe"
+                subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if process.poll() is None:
+                    process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait()
             code = 124
         output.seek(0)
@@ -907,14 +933,15 @@ def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeo
         if code:
             scanner.add("verification", "quality", "venv-creation-failed", "release-check.json", value=output)
             return result
-        environment = safe_environment(workspace / "home", env_dir / "bin")
+        bin_dir = env_dir / ("Scripts" if sys.platform == "win32" else "bin")
+        environment = safe_environment(workspace / "home", bin_dir)
         for step, item in enumerate([*manifest["quickstart"], *manifest["checks"]], 1):
             code, output = command(item["argv"], clean, environment, timeout)
             results.append({"step": step, "role": item.get("role", "quickstart"), "exit_code": code, "output_fingerprint": fingerprint(output)})
             if code:
-                scanner.add("verification", "quality", "command-failed", item.get("file", "release-check.json"), item.get("line", 0), output)
+                scanner.add("verification", "quality", "command-not-found" if code == 127 and output == MISSING_EXECUTABLE_OUTPUT else "command-failed", item.get("file", "release-check.json"), item.get("line", 0), output)
                 return result
-        code, output = command([str(env_dir / "bin/python"), "-c", METADATA_SCRIPT], clean, environment, timeout)
+        code, output = command([str(bin_dir / ("python.exe" if sys.platform == "win32" else "python")), "-c", METADATA_SCRIPT], clean, environment, timeout)
         if code:
             scanner.add("verification", "license", "dependency-metadata-failed", "pyproject.toml", value=output)
         else:
