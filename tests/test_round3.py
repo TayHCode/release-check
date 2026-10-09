@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import release_check as rc
 import test_release_check as fixtures
@@ -18,6 +18,14 @@ class LauncherTests(unittest.TestCase):
                 original = list(argv)
                 self.assertEqual(rc.verification_argv(argv, python), [str(python), '-m', 'unittest'])
                 self.assertEqual(argv, original)
+
+    def test_windows_destination_display_keeps_literal_backslashes(self):
+        path = MagicMock(spec=Path)
+        path.__str__.return_value = 'F:' + chr(92) + 'review' + chr(92) + 'export.BLOCKED'
+        path.exists.return_value = True
+        detail = rc.export_destination_error(path).detail
+        self.assertIn(str(path), detail)
+        self.assertNotIn(chr(92) * 2, detail)
 
     def test_unrelated_executables_and_explicit_paths_are_preserved(self):
         for name in ('pytest', 'python2', '/custom/python', 'python3.99'):

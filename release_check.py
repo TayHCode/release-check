@@ -693,7 +693,7 @@ def submodule_paths(repo: Path) -> set[str]:
 
 def export_destination_error(*paths: Path) -> AuditError:
     existing = [str(path) for path in paths if path.exists() or path.is_symlink()]
-    return AuditError("export-destination-exists", "In the way: " + ", ".join(json.dumps(path) for path in existing)
+    return AuditError("export-destination-exists", "In the way: " + ", ".join(json.dumps(path).replace("\\\\", "\\") for path in existing)
                       + ". Keep these folders and rerun the same command with --export NEW_DIR, where NEW_DIR and NEW_DIR.BLOCKED do not exist.")
 
 
