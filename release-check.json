@@ -1,0 +1,120 @@
+{
+  "exclude": [],
+  "approvals": [
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "a541acfac2e64958",
+      "reason": "The detector's own path pattern text, not a user's home directory."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "a541acfac2e64958",
+      "reason": "The detector's own path pattern text, not a user's home directory."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "b9f44d4003eb7eda",
+      "reason": "The detector's own path pattern text, not a user's home directory."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "b9f44d4003eb7eda",
+      "reason": "The detector's own path pattern text, not a user's home directory."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "release_check.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "The detector's own syntax for a public Git hosting SSH reference."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "release_check.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "The detector's own syntax for a public Git hosting SSH reference."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "release_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "reason": "The detector's address syntax and dependency classifier punctuation."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "release_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "reason": "The detector's address syntax and dependency classifier punctuation."
+    },
+    {
+      "scope": "tree",
+      "kind": "tailnet-ip",
+      "path": "release_check.py",
+      "fingerprint": "4b2228c26597aeca",
+      "reason": "The detector's published overlay-network range, not a machine address."
+    },
+    {
+      "scope": "history",
+      "kind": "tailnet-ip",
+      "path": "release_check.py",
+      "fingerprint": "4b2228c26597aeca",
+      "reason": "The detector's published overlay-network range, not a machine address."
+    }
+  ],
+  "quickstart": [
+    {
+      "file": "README.md",
+      "line": 62,
+      "argv": [
+        "python",
+        "-m",
+        "pip",
+        "install",
+        "."
+      ]
+    },
+    {
+      "file": "README.md",
+      "line": 63,
+      "argv": [
+        "release-check",
+        "--help"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "role": "tests",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-q"
+      ]
+    },
+    {
+      "role": "syntax",
+      "argv": [
+        "python",
+        "-m",
+        "compileall",
+        "-q",
+        "release_check.py"
+      ]
+    }
+  ]
+}
