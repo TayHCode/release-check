@@ -282,8 +282,9 @@ profile/temp folders; Linux and macOS use `bin`. Declared commands must be
 available in that fresh environment, rather than only in your personal PATH.
 
 Manual items always remain `to do`. Repeat the README on another machine or user
-account, confirm the license holder and hosting-site fields, and publish the export
-as a new repository. Inspect its commit and confirm its digest before publishing.
+account and confirm the license holder and hosting-site fields. Publish the export
+as a new repository only after a clean verdict, digest PASS and owner approval.
+Inspect its commit and confirm its digest before publishing.
 Revoke credentials even when they existed only in old commits; deletion is not
 revocation. Review media and embedded metadata, unreadable content and third-party
 licenses when the list calls for them. After publishing, view the page while signed

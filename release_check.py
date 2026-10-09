@@ -1226,7 +1226,7 @@ def test_list(report: dict, manifest: dict, scanner: Scanner) -> list[dict]:
     manual("fresh-clone", "Clone the export into an empty folder, ideally on another machine or user account, and follow the README from its first line. Nothing may depend on files, tools or logins only you have.")
     if "export" in report:
         manual("inspect-commit", "Read the export's single commit with `git log --format=fuller -1`. Author, committer, date and message must be generic.")
-    manual("publish-export-not-original", f"Publish the export folder as a new repository. Do not switch the original repository to public: its old commits were not rewritten ({history} findings in history).")
+    manual("publish-export-not-original", f"Only after a clean export verdict, PASS from --check-digest and owner approval, publish the export folder as a new repository. Do not switch the original repository to public: its old commits were not rewritten ({history} findings in history).")
     if any(f["category"] == "secrets" for f in findings):
         manual("rotate-credentials", "Revoke or replace every credential the audit found, including those only in old commits.")
     media = {f["path"] for f in findings if f["category"] == "media"}

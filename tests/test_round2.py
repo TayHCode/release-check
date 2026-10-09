@@ -132,6 +132,17 @@ class Round2Tests(unittest.TestCase):
         self.assertEqual((blocked / 'keep').read_text(), 'existing')
         self.assertFalse(target.exists())
 
+    def test_plan_and_manual_publication_step_require_clean_verdict(self):
+        code, out, err = self.run_cli('--export', str(self.root / 'blocked-plan'))
+        self.assertEqual(code, 1, out + err)
+        report = self.latest_report()
+        publish = next(step for step in report['plan'] if step['id'] == 'publish')
+        manual = next(step for step in report['pre_publish_tests'] if step['id'] == 'publish-export-not-original')
+        for step in (publish, manual):
+            self.assertIn('clean export verdict', step['text'])
+            self.assertIn('PASS from --check-digest', step['text'])
+            self.assertIn('owner approval', step['text'])
+
     def test_utf8_bom_manifest_and_terms_are_accepted_silently(self):
         (self.repo / 'release-check.json').write_text(json.dumps(self.manifest), encoding='utf-8-sig')
         for filename, content in (('terms.json', '["HiddenPerson"]'), ('terms.txt', '# ignored\nHiddenPerson\n')):
