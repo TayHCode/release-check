@@ -97,14 +97,16 @@
     {
       "role": "tests",
       "argv": [
-        "python",
+        "python3",
         "-m",
         "unittest",
         "discover",
         "-s",
         "tests",
         "-q"
-      ]
+      ],
+      "file": "README.md",
+      "line": 577
     },
     {
       "role": "syntax",
