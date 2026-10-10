@@ -70,6 +70,34 @@
       "path": "release_check.py",
       "fingerprint": "4b2228c26597aeca",
       "reason": "The detector's published overlay-network range, not a machine address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "README.md",
+      "fingerprint": "551a8fa62e5a265d",
+      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "README.md",
+      "fingerprint": "fc9794e5a27489a0",
+      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "README.md",
+      "fingerprint": "551a8fa62e5a265d",
+      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "README.md",
+      "fingerprint": "fc9794e5a27489a0",
+      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
     }
   ],
   "quickstart": [
