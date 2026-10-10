@@ -15,7 +15,9 @@ class PythonVersionTests(unittest.TestCase):
         result = self.run_old_python('--help')
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, '')
-        self.assertEqual(result.stderr, 'release-check needs Python 3.11 or newer; you have 3.9.6.\n')
+        self.assertTrue(result.stderr.startswith('release-check needs Python 3.11 or newer; you have 3.9.6.'))
+        self.assertIn('README Quickstart', result.stderr)
+        self.assertIn('no-admin uv/Python 3.12 route', result.stderr)
 
     def test_old_python_json_keeps_structured_error_with_version(self):
         result = self.run_old_python('--json')

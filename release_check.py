@@ -23,7 +23,7 @@ import sys
 import tempfile
 if sys.version_info < (3, 11):
     version = ".".join(str(part) for part in sys.version_info[:3])
-    message = f"release-check needs Python 3.11 or newer; you have {version}."
+    message = f"release-check needs Python 3.11 or newer; you have {version}. See README Quickstart for the no-admin uv/Python 3.12 route."
     if "--json" in sys.argv[1:]:
         print(json.dumps({"ready": False, "error": "audit-incomplete", "code": "python-version", "verdict": "INCOMPLETE", "message": message}), file=sys.stderr)
     else:
@@ -35,8 +35,9 @@ import unicodedata
 
 VERSION = "0.2.0"
 PASS_LIMITATIONS = "This is not a complete secret scanner. Encoded, split or obfuscated secrets or personal data may be missed, as may unlisted names. Run a dedicated secret scanner too and read the export yourself before publishing."
-BLOCKED_EXPORT_WARNING = "EXPORT BLOCKED: the requested destination was not created. The *.BLOCKED folder is private and may contain credentials or personal data. Do not publish it; delete it after fixing the source, then export to a new folder."
+BLOCKED_EXPORT_WARNING = "EXPORT BLOCKED: the requested destination was not created. The *.BLOCKED folder is a plain private folder, not a Git repository, and may contain credentials or personal data. Read README-BLOCKED.txt. Do not publish it or run git init in it; delete it after fixing the source, then export to a new folder."
 AUDIT_RECORD = "release-check-audit.json"
+BLOCKED_README = "README-BLOCKED.txt"
 MISSING_EXECUTABLE_OUTPUT = b"Declared executable was not found in the verification environment."
 MEDIA = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mov", ".wav", ".mp3", ".heic"}
 GENERATED = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build"}
@@ -139,7 +140,7 @@ FIXES: dict[str, str] = {
     "verification-not-run": "Run again with --verify to execute the declared commands in a clean clone.",
     "quickstart-document-mismatch": "The command in release-check.json differs from that line of the document. Make them identical.",
     "quickstart-document-missing": "The document named in the quickstart entry does not exist. Create it or correct the entry.",
-    "venv-creation-failed": "Verification tried python -m venv, then available uv venv and virtualenv, but could not create an environment with pip. Debian/Ubuntu fix: sudo apt install python3-venv (use the matching versioned package for a versioned Python). macOS fix: brew install python@3.12. Windows fix: winget install --exact --id Python.Python.3.12. Without admin access, install uv into your home using its official script: Linux/macOS: curl -LsSf https://astral.sh/uv/install.sh | sh; Windows PowerShell: powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\". Then run uv run --no-project --python 3.12 python release_check.py with your audit arguments. For a declared stdlib-only project, --verify-no-venv uses the current interpreter with less isolation. This run did not execute the quickstart or tests.",
+    "venv-creation-failed": "Verification could not create a venv; quickstart and tests did not run. No-admin fix: install uv into your home using the official script and re-run --verify, or use --verify-no-venv if the manifest declares stdlib_only. Details: Linux/macOS: curl -LsSf https://astral.sh/uv/install.sh | sh; Windows PowerShell: powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\". Follow the installer PATH instructions, then re-run the same command. Verification tried python -m venv, available uv venv and virtualenv with pip. An administrator can install the matching python3-venv package on Debian/Ubuntu, Python via Homebrew on macOS, or Python via winget on Windows. This run did not execute the quickstart or tests.",
     "no-venv-not-stdlib": "--verify-no-venv requires stdlib_only: true in the manifest and no declared project dependencies. Use --verify for projects that install packages.",
     "command-not-found": "A declared executable was not found in the fresh verification environment. Install the required tool in an earlier quickstart step, or correct the command in release-check.json.",
     "command-failed": "A declared command failed in the clean clone. Run it yourself in a fresh clone to see why.",
@@ -153,7 +154,8 @@ ERRORS: dict[str, str] = {
     "export-not-clean": "The export folder is not a single clean commit. Export again into a new folder.",
     "denylist-required": "Pass --denylist FILE or set RELEASE_CHECK_DENYLIST. The README shows how to make the file.",
     "denylist-not-found": "The private-terms file does not exist.",
-    "denylist-schema": "The private-terms file is empty or not in a supported format.",
+    "denylist-schema": "The private-terms file is empty or not in a supported format. Private-term coverage is INCOMPLETE: no real private terms were configured. Add your own private terms outside the source repository.",
+    "denylist-example": "Private-term coverage is INCOMPLETE: placeholder/example terms remain; no real private terms are configured in an all-example list. Replace every shipped placeholder with your own private terms outside the source repository, then run again.",
     "denylist-json": "The private-terms file is not valid JSON. Correct the JSON syntax and run again.",
     "denylist-encoding": "The private-terms file must be UTF-8 (an optional UTF-8 BOM is accepted). Save it as UTF-8, not UTF-16 or a legacy encoding.",
     "denylist-inside-source": "Keep the private-terms file outside the repository being audited.",
@@ -197,6 +199,8 @@ class PrivateParser(argparse.ArgumentParser):
 def print_error(code: str, json_mode: bool, detail: str | None = None):
     if json_mode:
         error = {"ready": False, "error": "audit-incomplete", "code": code}
+        if code == 'denylist-example':
+            error.update(verdict='INCOMPLETE', message=ERRORS[code])
         if detail:
             error["message"] = ERRORS[code] + " " + detail
         print(json.dumps(error), file=sys.stderr)
@@ -290,6 +294,10 @@ def load_terms(path: Path) -> list[str]:
         terms = [line.strip() for line in raw.splitlines() if line.strip() and not line.startswith("#")]
     if not terms or any(not isinstance(t, str) or not t.strip() for t in terms):
         raise AuditError("denylist-schema")
+    normalized = [re.sub(r"[\s_-]+", " ", normalize(t).strip().casefold()) for t in terms]
+    if (any(t.startswith("replace with ") for t in normalized)
+            or all(t in {"example", "placeholder", "your name", "your username", "your employer", "your machine", "your town"} for t in normalized)):
+        raise AuditError("denylist-example")
     if not isinstance(domains, list) or any(not isinstance(d, str) or not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", d) for d in domains):
         raise AuditError("denylist-schema")
     result = Terms(terms)
@@ -764,8 +772,38 @@ def copy_tree(repo: Path, target: Path, manifest: dict, scanner: Scanner):
     return {"files": copied, "not_exported": sorted(left)}
 
 
+def blocked_artifact(target: Path) -> bool:
+    return target.is_dir() and not (target / ".git").exists() and not (target / ".git").is_symlink() and (target / BLOCKED_README).is_file()
+
+
+def quarantine_export(target: Path):
+    """Remove only this run's generated Git metadata, including secret blobs."""
+    metadata = target / ".git"
+    record = metadata / AUDIT_RECORD
+    if record.is_file():
+        (target / AUDIT_RECORD).write_bytes(record.read_bytes())
+        (target / AUDIT_RECORD).chmod(0o600)
+    warning = target / BLOCKED_README
+    warning.write_text(BLOCKED_EXPORT_WARNING + "\n\nThis folder is NOT a release. Fix the source and create a new verified export.\n", encoding="utf-8")
+    warning.chmod(0o600)
+    if metadata.is_dir() and not metadata.is_symlink():
+        def remove_readonly(function, path, _error):
+            os.chmod(path, 0o700)
+            function(path)
+        shutil.rmtree(metadata, onerror=remove_readonly)
+
+
 def export_digest(target: Path) -> str:
     try:
+        if blocked_artifact(target):
+            content = hashlib.sha256(b"release-check blocked artifact v1\0")
+            for file in sorted(target.rglob("*"), key=lambda p: p.relative_to(target).as_posix()):
+                if file.is_symlink() or not (file.is_dir() or file.is_file()):
+                    raise AuditError("export-not-clean")
+                content.update(file.relative_to(target).as_posix().encode("utf-8", "surrogateescape") + b"\0")
+                content.update(str(file.stat().st_mode & 0o111).encode() + b"\0" + str(file.stat().st_mtime_ns).encode() + b"\0")
+                content.update((b"directory" if file.is_dir() else file.read_bytes()) + b"\0")
+            return content.hexdigest()
         metadata = target / ".git"
         if (metadata.is_symlink() or not metadata.is_dir()
                 or (metadata / "config").is_symlink()
@@ -1061,6 +1099,9 @@ def group_of(finding: dict) -> str:
 
 def fix_for(finding: dict) -> str:
     scope = finding["scope"]
+    if finding.get("why") == "source-only" and scope in {"history", "metadata"}:
+        return "Informational: this finding belongs to the SOURCE repository. Its history and Git metadata were not copied into the export. Keep the source private." + (" Revoke any exposed credential at the provider." if finding["category"] == "secrets" else "")
+    snapshot = finding.get("origin") == "export" and scope in {"history", "metadata"}
     if finding["kind"] == "missing-document":
         return {
             "CONTRIBUTING.md": "Create CONTRIBUTING.md with instructions for setting up development, running tests and proposing changes.",
@@ -1072,8 +1113,8 @@ def fix_for(finding: dict) -> str:
         if finding["kind"] == "email" and scope == "metadata" and (finding["path"].startswith("@commit/") or finding["path"] == "@config"):
             return "Git contains an author or committer email address. Use --verify --export to make a one-commit copy with generic authorship and no source Git config. Keep the original history private. Editing working files cannot remove commit metadata; do not approve a real personal address just to pass."
         approval = f'This finding still lacks approval in scope "{scope}". A deliberate public example needs an approval for this scope in release-check.json.'
-        return approval + " " + (HISTORY_FIX if scope in {"history", "metadata"} else FIXES[finding["kind"]])
-    if finding["scope"] in {"history", "metadata"} and finding["category"] in {"personal", "secrets"}:
+        return approval + " " + (HISTORY_FIX if scope in {"history", "metadata"} and not snapshot else FIXES[finding["kind"]])
+    if finding["scope"] in {"history", "metadata"} and finding["category"] in {"personal", "secrets"} and not snapshot:
         return HISTORY_FIX + (" Revoke the credential at the provider." if finding["category"] == "secrets" else "")
     return FIXES.get(finding["kind"], "Review this item by hand and run again.")
 
@@ -1104,14 +1145,15 @@ def record_export_audit(target: Path, report: dict) -> dict:
 
 def read_export_audit(target: Path) -> dict | None:
     try:
-        record = json.loads((target / ".git" / AUDIT_RECORD).read_text(encoding="utf-8"))
+        blocked = blocked_artifact(target)
+        record = json.loads((target / AUDIT_RECORD if blocked else target / ".git" / AUDIT_RECORD).read_text(encoding="utf-8"))
         if (not isinstance(record, dict) or type(record.get("format")) is not int or record["format"] != 1
                 or record.get("verdict") not in {"PASS", "FIX-THESE"}
                 or type(record.get("blocking_count")) is not int or record["blocking_count"] < 0
                 or type(record.get("verified")) is not bool
                 or record.get("isolation") not in {"venv", "uv", "virtualenv", "current-interpreter (less isolated)", "not-run"}
                 or (record["verified"] and record["isolation"] == "not-run")
-                or record.get("commit") != git(target, "rev-parse", "HEAD").strip().decode("ascii")
+                or (not blocked and record.get("commit") != git(target, "rev-parse", "HEAD").strip().decode("ascii"))
                 or (record["verdict"] == "PASS" and (record["blocking_count"] != 0 or not record["verified"]))):
             return None
         return record
@@ -1140,7 +1182,7 @@ def classify(report: dict) -> dict:
             finding["severity"] = "warning" if finding["reviewed"] else "blocking"
             if finding["reviewed"]:
                 finding["why"] = "acknowledged"
-            if not finding["reviewed"] and key(finding) not in target_keys:
+            if not finding["reviewed"] and (finding["scope"] in {"history", "metadata"} or key(finding) not in target_keys):
                 finding.update(severity="warning", why="source-only")
                 warnings.append(finding)
     verdict = "PASS" if target["ready"] and not blocking else "FIX-THESE"
@@ -1191,7 +1233,8 @@ def build_plan(report: dict, scrub: dict) -> list[dict]:
     steps = []
     def add(identifier, actor, text, status=None):
         steps.append({"id": identifier, "actor": actor, "status": status or ("needed" if actor == "you" else "done" if "export" in report else "planned"), "text": text})
-    add("read", "tool", f"Read the working files and all {scrub['history']['commits']} commits of local history. Change nothing in the repository.", "done")
+    commits = scrub['history']['commits']
+    add("read", "tool", f"Read the SOURCE working files and all {commits} {'commit' if commits == 1 else 'commits'} of local history. Change nothing in the repository.", "done")
     if scrub["drop_files"]:
         add("drop-excluded", "tool", f"Leave out {len(scrub['drop_files'])} tracked files that match the built-in or manifest exclusions.")
     if scrub["not_exported_count"]:
@@ -1281,12 +1324,18 @@ def format_text(report: dict) -> str:
     if verdict == "PASS":
         lines.append("The declared checks passed and no detected findings block the judged target. Finish TEST BEFORE PUBLISHING and manual review.")
         lines.append(PASS_LIMITATIONS)
-    lines += ["Judged: " + ("the export (one commit, no history)" if "export" in report else "the source repository"),
+    if len(classified['blocking']) == 1 and classified['blocking'][0]['kind'] == 'verification-not-run':
+        lines.append("No content or repository problems found. The single reason for FIX-THESE is verification-not-run: run with --verify.")
+    if any(f['kind'] == 'venv-creation-failed' for f in classified['blocking']):
+        lines.append("Verification could not create a venv; quickstart and tests did not run.")
+        lines.append("No-admin fix: install uv into your home with the official script (README), then re-run --verify; or use --verify-no-venv for a declared stdlib-only project. Details follow under BLOCKING.")
+    lines += ["Judged: " + ("the export (one commit, no history)" if "export" in report and target['ready'] else "the blocked export snapshot (no Git repository, no history)" if "export" in report else "the source repository"),
               f"Blocking: {len(classified['blocking'])}   Warnings: {len(classified['warnings'])}"]
     if "export" in report and not target["ready"]:
         lines.append("WARNING: " + BLOCKED_EXPORT_WARNING)
     stats = target.get("stats", {})
-    lines.append(f"Scanned: {stats.get('tree_files', 0)} working files, {stats.get('history_commits', 0)} commits")
+    commits = stats.get('history_commits', 0)
+    lines.append(f"Scanned: {stats.get('tree_files', 0)} working files, {commits} {'commit' if commits == 1 else 'commits'}" + (" in the temporary export snapshot; SOURCE history is informational" if "export" in report else ""))
     if report.get("scrub_plan", {}).get("working_changes"):
         lines.append("NOTICE: Tracked files have uncommitted or staged changes. Exports use current working bytes.")
     for key, title in (("blocking", "BLOCKING - fix these, then run again"), ("warnings", "WARNINGS - reported, not blocking")):
@@ -1305,7 +1354,8 @@ def format_text(report: dict) -> str:
             for finding in group[:10]:
                 location = finding_location(finding)
                 term = "   term " + str(finding["term_index"]) if "term_index" in finding else ""
-                lines.append(f"   {finding['kind']}   {location}   {finding['scope']}   id {finding['fingerprint']}{term}")
+                scope = "export snapshot (approval scope " + finding['scope'] + ")" if finding.get('origin') == 'export' and finding['scope'] in {'history', 'metadata'} else "SOURCE " + finding['scope'] if finding.get('why') == 'source-only' else finding['scope']
+                lines.append(f"   {finding['kind']}   {location}   {scope}   id {finding['fingerprint']}{term}")
             if len(group) > 10:
                 lines.append(f"   ... and {len(group) - 10} more in report.md")
             for fix in dict.fromkeys(fix_for(f) for f in group):
@@ -1320,7 +1370,7 @@ def format_text(report: dict) -> str:
     if report.get("scrub_plan", {}).get("by_class"):
         lines.append("   Scrub class counts:")
     for label, counts in report.get("scrub_plan", {}).get("by_class", {}).items():
-        lines.append(f"   {label}: {counts['files']} in files, {counts['history']} in history")
+        lines.append(f"   {label}: {counts['files']} in SOURCE files, {counts['history']} in SOURCE history")
     lines += ["", "TEST BEFORE PUBLISHING"]
     for number, item in enumerate(report.get("pre_publish_tests", []), 1):
         lines.append(f" {number}. [{item['status']}] {item['text']}")
@@ -1346,7 +1396,8 @@ def format_markdown(report: dict) -> str:
     for finding in findings:
         location = finding_location(finding) if finding["scope"] == "metadata" else finding["path"]
         path = location.replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
-        lines.append(f"| {finding['scope']} | {finding['kind']} | {path} | {finding['line']} | {finding['fingerprint']} | {finding.get('term_index', '')} | {finding['reviewed']} |")
+        origin = "export snapshot" if finding.get('origin') == 'export' else "SOURCE" if 'export' in report else "source"
+        lines.append(f"| {origin}: {finding['scope']} | {finding['kind']} | {path} | {finding['line']} | {finding['fingerprint']} | {finding.get('term_index', '')} | {finding['reviewed']} |")
     target = report.get("export", report)
     lines += ["", "License: " + json.dumps(target["license"], sort_keys=True), "", "Verification: " + json.dumps(target["verification"], sort_keys=True)]
     return ("\n".join(lines) + "\n").encode("ascii", "backslashreplace").decode("ascii")
@@ -1381,12 +1432,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(raw_args)
     os.umask(0o077)
     directory = None
+    owned_export = None
     try:
         if args.check_digest is not None:
             if not re.fullmatch(r"[a-fA-F0-9]{64}", args.check_digest):
                 raise AuditError("invalid-digest")
             repo = args.repo.expanduser().resolve()
-            validate_repo(repo)
+            if not blocked_artifact(repo):
+                validate_repo(repo)
             try:
                 unchanged = export_digest(repo) == args.check_digest.lower()
             except AuditError as error:
@@ -1394,7 +1447,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise
                 unchanged = False
             record = read_export_audit(repo) if unchanged else None
-            clean = unchanged and record is not None and record["verdict"] == "PASS" and record["blocking_count"] == 0 and record["verified"]
+            clean = not blocked_artifact(repo) and unchanged and record is not None and record["verdict"] == "PASS" and record["blocking_count"] == 0 and record["verified"]
             verdict = "PASS" if clean else "FIX-THESE"
             if clean:
                 text = "DIGEST MATCHES AND THE EXPORT IS CLEAN: 0 blocking findings (PASS)"
@@ -1456,6 +1509,9 @@ def main(argv: list[str] | None = None) -> int:
             target = requested_target.with_name(requested_target.name + ".BLOCKED")
             if not args.json:
                 print("Export starts in a private *.BLOCKED folder; the requested destination is created only after a clean verdict.")
+            if target.exists() or target.is_symlink():
+                raise export_destination_error(target)
+            owned_export = target
             copied = copy_tree(repo, target, manifest, scanner)
             export_report = run_audit(target, terms, manifest_for(target, args.manifest), args.private_repo, args.verify or args.verify_no_venv, directory, args.timeout)
             for finding in scanner.findings:
@@ -1485,12 +1541,18 @@ def main(argv: list[str] | None = None) -> int:
                             export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
                             export_report["ready"] = False
             export_report["commit"] = git(target, "rev-parse", "HEAD").strip().decode("ascii")
+            for finding in export_report['findings']:
+                finding['origin'] = 'export'
             export_report["audit_record"] = record_export_audit(target, export_report)
             if export_report["ready"]:
                 if requested_target.exists() or requested_target.is_symlink():
                     raise export_destination_error(requested_target)
                 target.rename(requested_target)
                 target = requested_target
+                owned_export = None
+            else:
+                quarantine_export(target)
+                owned_export = None
             export_report["folder_suffix"] = "" if export_report["ready"] else ".BLOCKED"
             export_report["digest"] = export_digest(target)
             export_report["file_count"] = len(copied["files"])
@@ -1518,7 +1580,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(format_text(report), end="")
         return 0 if report.get("export", report)["ready"] else 1
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
+        if owned_export is not None and owned_export.is_dir():
+            quarantine_export(owned_export)
         # The CLI boundary must not expose paths or exception details in a traceback.
         code = error.args[0] if isinstance(error, AuditError) and len(error.args) == 1 and isinstance(error.args[0], str) and error.args[0] in ERRORS else "audit-incomplete"
         try:

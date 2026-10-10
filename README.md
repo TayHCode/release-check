@@ -178,6 +178,10 @@ $env:RELEASE_CHECK_REPORTS = 'C:\private\reports'
 
 Without a reports override, reports go to `~/.local/state/release-check`.
 The terms file is mandatory for auditing and is never copied into an export.
+An empty list, an all-example list, or any unreplaced shipped `Replace With ...`
+placeholder stops the audit with **INCOMPLETE** and a private-term coverage warning.
+Replace every placeholder with your own private terms before auditing. The tool
+cannot tell whether an otherwise valid list includes every private name.
 
 ## The three steps
 
@@ -198,7 +202,8 @@ Before aiming for PASS, your repository needs:
 The document checks test presence and the limitations heading; they do not
 judge the completeness of contribution instructions or validate issue forms.
 
-1. Audit: `release-check REPO`.
+1. Audit: `release-check REPO`. If nothing else is wrong, the single blocker is
+   `verification-not-run: run with --verify`; a plain audit does not execute tests.
 2. Fix every item under BLOCKING, then run the audit again. Keep the source private.
 3. Build and verify an export: `release-check REPO --verify --export NEW_DIR`.
 
@@ -224,6 +229,11 @@ Every unreviewed finding in the judged target blocks. A warning is either an exa
 finding you acknowledged in the manifest, or a finding found only in the private
 source when the export is being judged. Without an export, old-commit findings
 still block. The original repository can remain blocked while its export passes.
+Export rows marked **export snapshot** describe the new snapshot commit, with
+working-file fixes; their original approval scopes remain explicit. Rows marked
+**SOURCE history** or **SOURCE metadata** are informational warnings about the
+private source. Its history was already discarded; there is no need to make
+another one-commit copy of the export.
 In particular, a real author or committer email in Git history is expected to
 block a source audit. Editing the README cannot remove it. Locations identify the commit and its author/committer metadata; `.git/config`
 means the local Git configuration, not a tracked source file. Those identity
@@ -266,7 +276,9 @@ are identified by position and role; their arguments and output are never printe
 Run with `--verify` to execute them in a clean clone with a fresh HOME and venv.
 Verification needs Python 3.11+. It tries `python -m venv`, then `uv venv`
 (with pip seeded) if uv is on PATH, then `virtualenv` if available. If all fail,
-`venv-creation-failed` names the OS-specific fix and the no-admin uv route above;
+`venv-creation-failed` leads with the no-admin fix: install uv into your home
+with its official script above, follow its PATH instructions and re-run `--verify`.
+For a declared stdlib-only project, `--verify-no-venv` is also available;
 quickstart and tests remain `not run`. On Debian/Ubuntu the administrator fix is
 `sudo apt install python3-venv` (use the matching versioned package if needed).
 On macOS use `brew install python@3.12`; on Windows use
@@ -319,8 +331,12 @@ commit and all license and quality checks. `--verify` also verifies the export.
 An export starts in `DIR.BLOCKED`, a **private review artifact**. Only a clean
 verified audit moves it to the requested `DIR`. A blocked, failed or interrupted
 run leaves only `DIR.BLOCKED` and never prints PASS. A loud warning identifies
-this folder: it can contain the reported credentials or personal data. Do not
-publish it. Delete it after fixing the source, then export again to a new folder;
+this folder: it can contain the reported credentials or personal data. A blocked
+output is a **plain folder with no `.git` directory**, with `README-BLOCKED.txt`
+and a root `release-check-audit.json` when the audit completed. Generated Git
+objects are removed even if the export audit raises an exception. These two
+diagnostic names are reserved in blocked output. Never publish the folder or
+run `git init` in it. Delete it after fixing the source, then export again to a new folder;
 existing requested or `.BLOCKED` paths are never overwritten.
 
 The report records the export commit, file count and SHA-256 digest. Immediately
@@ -336,7 +352,10 @@ was PASS with zero blocking findings and completed verification. Integrity alone
 is insufficient. An unchanged blocked export says **DIGEST MATCHES BUT THE
 EXPORT WAS NOT CLEAN: N blocking findings (FIX-THESE)** and exits 1. The output
 also says whether `--verify` ran or the less isolated `--verify-no-venv` was used.
-A missing/invalid audit record or a changed export returns FIX-THESE (1); a malformed digest, missing path or non-Git folder returns
+A blocked folder's digest covers its files, directories, executable modes and
+modification times, including both diagnostics. It can never pass as CLEAN,
+even if its audit record is edited to claim PASS. No Git commands are run for it.
+A missing/invalid audit record or a changed export returns FIX-THESE (1); a malformed digest, missing path or unrelated non-Git folder returns
 INCOMPLETE (2) with a reason.
 
 The digest requires one reachable commit across all refs and one on HEAD, exactly
@@ -515,8 +534,10 @@ text passes automatically. Tests and dependency checks assume a Python project;
 other dependency ecosystems always need manual review and cannot reach PASS.
 Malformed `pyproject.toml` or invalid manifest commands can end an audit as INCOMPLETE.
 Names and people absent from the private terms file are not checked. Unicode and
-word-separator normalisation cover only the forms listed above. Arbitrarily
-spaced letters, homoglyphs, leetspeak, base64-encoded terms, split strings and
+word-separator normalisation cover only the forms listed above. Spelled-out
+email words (such as `first dot last at mailbox dot invalid`) and
+bare machine names (such as `build01`) need private terms or manual review.
+Arbitrarily spaced letters, homoglyphs, leetspeak, base64-encoded terms, split strings and
 computed credentials are not decoded. UTF-32 text is not interpreted.
 
 False positives are expected, including machine-shaped identifiers, loopback

@@ -558,10 +558,9 @@ class AuditTests(unittest.TestCase):
         (self.repo / "accent-\u00e9.txt").write_bytes(b"Example\r\n")
         self.commit("Add byte and mode examples")
         target = self.root / "export"
-        code, out, err = self.run_cli("--export", str(target))
-        self.assertEqual(code, 1, out + err)
+        code, out, err = self.run_cli("--verify", "--export", str(target))
+        self.assertEqual(code, 0, out + err)
         export = self.latest_report()["export"]
-        target = target.with_name(target.name + ".BLOCKED")
         h = hashlib.sha256()
         for raw in sorted(filter(None, rc.git(target, "ls-files", "-z").split(b"\0"))):
             file = target / os.fsdecode(raw)
@@ -707,9 +706,10 @@ class AuditTests(unittest.TestCase):
             lines = (root / entry["file"]).read_text().splitlines()
             self.assertEqual(shlex.split(lines[entry["line"] - 1]), entry["argv"])
 
-    def test_example_denylist_loads_and_is_generic(self):
+    def test_example_denylist_is_generic_and_requires_replacement(self):
         path = Path(rc.__file__).parent / "examples/denylist.example.json"
-        self.assertTrue(rc.load_terms(path))
+        with self.assertRaisesRegex(rc.AuditError, 'denylist-example'):
+            rc.load_terms(path)
         scanner = rc.Scanner([])
         scanner.file(path.read_bytes(), "tree", "examples/denylist.example.json")
         self.assertEqual(scanner.findings, [])
