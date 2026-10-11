@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "release-check"
-version = "0.2.0"
+version = "0.3.0"
 description = "A conservative, local release-readiness audit and clean-export CLI"
 requires-python = ">=3.11"
 readme = "README.md"

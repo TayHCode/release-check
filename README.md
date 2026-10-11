@@ -25,7 +25,7 @@ An illustrative excerpt with invented data and omitted plan and test steps.
 The document locations and report folder below are invented examples:
 
 ```text
-release-check 0.2.0
+release-check 0.3.0
 
 VERDICT: FIX-THESE
 Judged: the source repository
@@ -187,9 +187,9 @@ cannot tell whether an otherwise valid list includes every private name.
 
 Before aiming for PASS, your repository needs:
 
-- `LICENSE` with the standard MIT text and the correct copyright holder;
-  declared license metadata must agree. Other licenses need manual review and
-  do not pass this tool's MIT policy automatically.
+- `LICENSE` with standard MIT or canonical Apache-2.0 text and the correct
+  copyright holder; declared Python/package license metadata must agree. Other
+  or modified license terms do not pass automatically.
 - `README.md` describing setup and use, with a heading containing
   `limitations`, `known issues` or `where it fails`.
 - `CONTRIBUTING.md` for development, tests and contribution instructions, and
@@ -506,14 +506,66 @@ and source provenance still need human review.
   only, as are valid base64 data URIs. URL path segments are checked separately
   rather than combined into one token. Explicit secret rules still apply.
   Media needs human review.
-- Standard MIT wording and license metadata; installed dependency metadata and
-  license-file evidence. NOTICE, UPSTREAM and license files are protected.
+- Standard MIT or canonical Apache-2.0 wording and consistent license metadata;
+  installed dependency metadata and license-file evidence. NOTICE, UPSTREAM and
+  license files are protected. Apache copyright and upstream NOTICE text observed
+  in local Git history must survive in the source and export.
 - README, limitations, CONTRIBUTING, SECURITY, issue templates, tests and declared
   quickstart, test, lint and type commands. Configured Ruff/mypy checks must be listed.
 
 Pass known-private repositories with repeated `--private-repo owner/name` flags.
 The tool never calls a hosting API to infer visibility. Supply this list separately;
 public and private URLs look the same without that evidence.
+
+## Apache-2.0 recognition and attribution
+
+Apache terms are checked against a SHA-256 hash of the whitespace-normalized
+[Apache Foundation text](https://www.apache.org/licenses/LICENSE-2.0.txt), also
+verified against [SPDX](https://spdx.org/licenses/Apache-2.0.html). The complete
+terms and headings must remain unchanged. The instructional appendix may be
+omitted, kept with its placeholder or filled-in copyright fields, or replaced
+with the standard applied copyright and boilerplate notice. Edits to terms,
+truncation, changed boilerplate or additional restrictions remain blocked.
+
+Python license strings and legacy `{text = "Apache-2.0"}` metadata are checked,
+as is `package.json` license metadata. Package ecosystems still require manual
+dependency review. A NOTICE is optional when no upstream NOTICE exists. When
+local Apache history contains one, the tool conservatively requires its retained
+text in the same file; added attribution is allowed. Copyright lines in retained
+source files and attribution files must survive. Deleted source files need not
+retain notices that no longer pertain, but protected license/notice files must
+remain. A license relabel cannot erase observed Apache attribution.
+
+The tool checks local history without fetching an upstream. An upstream absent
+from that history cannot be verified automatically: the owner must confirm the
+upstream LICENSE, NOTICE and copyright requirements and modification notices.
+License recognition is not a legal opinion or approval to publish.
+
+An explicit `license_owner_disposition` manifest entry can record one reviewed
+upstream exception: engineering-notebook at commit
+`b0a34caa4b59e466652572310fd043a9548027c2`, whose normalized terms differ in exactly
+three phrases. The entry must have `reviewed: true`, `spdx: "Apache-2.0"`,
+`path: "LICENSE"`, `source_url` equal to the upstream GitHub repository URL,
+`upstream_commit` equal to that full commit, `sha256` equal to the observed
+verbatim file hash
+`9177a3b208fb5034ae89ec90ed3c1f4192ca6825ef19699f5d62beace22bcbf5`,
+and this exact ordered `differences` array:
+
+```json
+[
+  {"canonical": "submitted to Licensor", "upstream": "submitted to the Licensor"},
+  {"canonical": "received by Licensor", "upstream": "received by the Licensor"},
+  {"canonical": "within such NOTICE file, excluding those notices", "upstream": "within such NOTICE file, excluding any notices"}
+]
+```
+
+Both the exact normalized variant terms and the observed upstream file are
+checked. Missing evidence, a wrong file hash, partial variants or any further
+change blocks. Unknown evidence fields cannot enter the report. An explicit
+disposition cannot be silently ignored by substituting canonical text. The
+observed upstream variant must also remain byte-identical in local history. The LICENSE stays verbatim and the disposition is printed in
+the audit report. This recorded owner disposition does not waive privacy,
+metadata, attribution, verification or publication requirements.
 
 ## Reports and privacy
 
@@ -529,8 +581,8 @@ A report still describes a private repository: **keep it private**.
 
 ## Honest limitations
 
-This is a release gate, not a security or legal guarantee. Only the standard MIT
-text passes automatically. Tests and dependency checks assume a Python project;
+This is a release gate, not a security or legal guarantee. Only standard MIT and canonical Apache-2.0
+text pass automatically. Tests and dependency checks assume a Python project;
 other dependency ecosystems always need manual review and cannot reach PASS.
 Malformed `pyproject.toml` or invalid manifest commands can end an audit as INCOMPLETE.
 Names and people absent from the private terms file are not checked. Unicode and

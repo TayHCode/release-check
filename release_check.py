@@ -33,7 +33,7 @@ import tomllib
 import tokenize
 import unicodedata
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PASS_LIMITATIONS = "This is not a complete secret scanner. Encoded, split or obfuscated secrets or personal data may be missed, as may unlisted names. Run a dedicated secret scanner too and read the export yourself before publishing."
 BLOCKED_EXPORT_WARNING = "EXPORT BLOCKED: the requested destination was not created. The *.BLOCKED folder is a plain private folder, not a Git repository, and may contain credentials or personal data. Read README-BLOCKED.txt. Do not publish it or run git init in it; delete it after fixing the source, then export to a new folder."
 AUDIT_RECORD = "release-check-audit.json"
@@ -118,8 +118,9 @@ FIXES: dict[str, str] = {
     "no-commits": "The repository has no commits. Commit the files first.",
     "submodule": "Submodules are not scanned or exported. Remove the submodule or vendor the code with its license.",
     "unsupported-file": "This entry is not a regular file and was left out of the export. Replace it with a regular file or remove it.",
-    "missing-license": "Add a LICENSE file. Only the standard MIT text passes automatically.",
-    "unrecognized-or-modified-license": "The license is not the unmodified MIT text. Restore the standard wording, or accept that this tool cannot pass a non-MIT license.",
+    "missing-license": "Add a LICENSE file. Only standard MIT or canonical Apache-2.0 text passes automatically.",
+    "unrecognized-or-modified-license": "Restore standard MIT or canonical Apache-2.0 wording. Other or modified license terms do not pass automatically.",
+    "invalid-license-owner-disposition": "Supply the exact reviewed upstream URL, full commit, verbatim LICENSE hash and three differences. Keep the upstream file unchanged; malformed or mismatched dispositions block.",
     "license-metadata-mismatch": "Make the license field in pyproject.toml match the LICENSE file.",
     "dynamic-license-or-dependencies": "Declare the license and dependencies as fixed values in pyproject.toml.",
     "dependency-ecosystem-manual-review": "This tool can only check Python dependency licenses. Review this ecosystem's dependency licenses by hand.",
@@ -588,7 +589,7 @@ def manifest_for(repo: Path, path: Path | None) -> dict:
         obj = json.loads(raw)
     except ValueError:
         raise AuditError("manifest-schema") from None
-    if not isinstance(obj, dict) or any(k not in {"exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses", "stdlib_only"} for k in obj):
+    if not isinstance(obj, dict) or any(k not in {"exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses", "license_owner_disposition", "stdlib_only"} for k in obj):
         raise AuditError("manifest-schema")
     if type(obj.get("stdlib_only", False)) is not bool:
         raise AuditError("manifest-schema")
@@ -620,6 +621,116 @@ def validate_commands(manifest: dict):
             raise AuditError("quickstart-document-path")
 
 
+def normalized_license(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def apache_license(text: str) -> bool:
+    """Match ASF/SPDX terms exactly; only wrapping and standard tails vary.
+
+    Sources: https://www.apache.org/licenses/LICENSE-2.0.txt and
+    https://spdx.org/licenses/Apache-2.0.html. The appendix is optional;
+    its identifying copyright fields may be filled in. A standard applied
+    boilerplate notice may replace the instructional appendix.
+    """
+    body, marker, tail = text.partition("END OF TERMS AND CONDITIONS")
+    if not marker or hashlib.sha256(normalized_license(body + marker).encode()).hexdigest() != "59d8f0ba87ad9a2f1a431123c8d16646e5b89ba53653e818f16d136d77263c99":
+        return False
+    if not tail.strip():
+        return True
+    # Only replace the identifying fields, never grant/disclaimer wording.
+    tail = re.sub(r"Copyright (?:\[yyyy\] \[name of copyright owner\]|\d{4}(?:[-, ]\d{4})* [^\r\n]+?)(?=\s+Licensed under the Apache License)",
+                  "Copyright [yyyy] [name of copyright owner]", tail)
+    digest = hashlib.sha256(normalized_license(tail).encode()).hexdigest()
+    return digest in {"15e0e14d590e112dcf1801fb0ca4a74c6178f468147941bfe6840cb55fa84ca4",
+                      "108bfed552130bbe29d30b1526c0c443629be89bb82fd495357b7305db0693a1"}
+
+
+def known_upstream_license(text: str) -> bool:
+    """Identify the normalized, observed upstream file for retention checks only."""
+    return hashlib.sha256(normalized_license(text).encode()).hexdigest() == "a2016109f78ae6b763dd66c84d3fa11c61389c6b787d4b50bc02d2ea9c883a2a"
+
+
+def upstream_license_disposition(path: Path, text: str, manifest: dict) -> dict | None:
+    """Accept only the reviewed upstream's exact three normalized term variants.
+
+    This is recorded owner evidence, not automatic canonical recognition.
+    Hash the verbatim bytes; never rewrite the retained license.
+    """
+    evidence = manifest.get("license_owner_disposition")
+    differences = [
+        {"canonical": "submitted to Licensor", "upstream": "submitted to the Licensor"},
+        {"canonical": "received by Licensor", "upstream": "received by the Licensor"},
+        {"canonical": "within such NOTICE file, excluding those notices",
+         "upstream": "within such NOTICE file, excluding any notices"},
+    ]
+    if (not isinstance(evidence, dict)
+            or set(evidence) != {"reviewed", "spdx", "path", "source_url", "upstream_commit", "sha256", "differences"}
+            or evidence.get("reviewed") is not True
+            or evidence.get("spdx") != "Apache-2.0" or evidence.get("path") != path.name
+            or path.name != "LICENSE"
+            or evidence.get("source_url") != "https://github.com/prime-radiant-inc/engineering-notebook"
+            or evidence.get("upstream_commit") != "b0a34caa4b59e466652572310fd043a9548027c2"
+            or evidence.get("sha256") != "9177a3b208fb5034ae89ec90ed3c1f4192ca6825ef19699f5d62beace22bcbf5"
+            or evidence.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
+            or evidence.get("differences") != differences or not known_upstream_license(text)):
+        return None
+    normalized = normalized_license(text)
+    body, marker, _ = normalized.partition("END OF TERMS AND CONDITIONS")
+    if not marker or hashlib.sha256((body + marker).encode()).hexdigest() != "a14c5bd2f88659c252bbac195ceb4c19e26f829132b552ffbddd26cb8b41a7d8":
+        return None
+    for difference in differences:
+        if normalized.count(difference["upstream"]) != 1:
+            return None
+        normalized = normalized.replace(difference["upstream"], difference["canonical"], 1)
+    return evidence if apache_license(normalized) else None
+
+
+def apache_attribution_audit(repo: Path, scanner: Scanner, destination: Path | None = None, scope: str = "tree"):
+    """Retain observed Apache upstream notices and copyright in local history.
+
+    No remote is consulted. Unknown upstream history remains an owner review.
+    Deleted source files need not retain notices that no longer pertain; the
+    distribution's license and NOTICE files must survive.
+    """
+    if not (repo / ".git").exists():
+        return
+    seen: set[tuple[bytes, bytes]] = set()
+    for commit in git(repo, "rev-list", "--all", "--reflog").splitlines():
+        entries = [entry.split(b"\t", 1) for entry in
+                   filter(None, git(repo, "ls-tree", "-r", "-z", commit.decode()).split(b"\0"))]
+        license_blobs = [metadata.split()[2] for metadata, raw_path in entries
+                         if raw_path.upper() in {b"LICENSE", b"LICENSE.MD", b"LICENSE.TXT", b"COPYING"}
+                         and metadata.split()[1] == b"blob" and metadata.split()[0] != b"120000"]
+        if not any(b"Apache License" in git(repo, "cat-file", "blob", blob.decode()) for blob in license_blobs):
+            continue
+        for metadata, raw_path in entries:
+            mode, kind, blob = metadata.split()
+            if kind != b"blob" or mode == b"120000" or (blob, raw_path) in seen:
+                continue
+            seen.add((blob, raw_path))
+            path = raw_path.decode("utf-8", "surrogateescape")
+            target = (destination or repo) / path
+            attribution_file = protected(path)
+            if not target.is_file() or target.is_symlink():
+                if attribution_file:
+                    scanner.add(scope, "license", "historical-attribution-missing", path, value=metadata)
+                continue
+            old = git(repo, "cat-file", "blob", blob.decode()).decode("utf-8", "replace")
+            current_text = target.read_text(errors="replace")
+            current = normalized_license(current_text)
+            if Path(path).name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"} and apache_license(old) and not apache_license(current_text):
+                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
+            if Path(path).name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"} and known_upstream_license(old) and git(repo, "cat-file", "blob", blob.decode()) != target.read_bytes():
+                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
+            if attribution_file and "NOTICE" in Path(path).name.upper():
+                notices = [line.strip() for line in old.splitlines() if line.strip()]
+            else:
+                notices = re.findall(r"(?im)^[ \t]*(?:[#/*;! -]+[ \t]*)?(Copyright[^\r\n]*)$", old)
+            if any(not re.search(re.escape(normalized_license(notice)) + r"(?!\w)", current) for notice in notices):
+                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
+
+
 def license_audit(repo: Path, scanner: Scanner, manifest: dict) -> dict:
     candidates = [p for p in repo.iterdir() if p.name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"}]
     result = {"status": "blocked", "identifier": None, "dependencies": "not-verified"}
@@ -627,21 +738,36 @@ def license_audit(repo: Path, scanner: Scanner, manifest: dict) -> dict:
         scanner.add("tree", "license", "missing-license", "LICENSE")
         return result
     text = candidates[0].read_text(errors="replace")
+    disposition = upstream_license_disposition(candidates[0], text, manifest)
+    if "license_owner_disposition" in manifest and disposition is None:
+        scanner.add("tree", "license", "invalid-license-owner-disposition", candidates[0].name)
     # Compare all standard MIT grant/disclaimer wording, allowing wrapping and owner/year.
     canonical_hash = "fe2a9817987f862eaced948f0468c7f51d2fedfc48c5c505b246a49a3870e9a5"
     normalize = lambda t: re.sub(r"\s+", " ", t[t.find("Permission is hereby granted"):]).strip()
     if "MIT License" in text and "Permission is hereby granted" in text and hashlib.sha256(normalize(text).encode()).hexdigest() == canonical_hash:
         result.update(status="pass", identifier="MIT")
+    elif apache_license(text):
+        result.update(status="pass", identifier="Apache-2.0")
+    elif disposition:
+        result.update(status="pass", identifier="Apache-2.0", owner_disposition=disposition)
     else:
         scanner.add("tree", "license", "unrecognized-or-modified-license", candidates[0].name, value=text)
     project = {}
     if (repo / "pyproject.toml").exists():
         project = tomllib.loads((repo / "pyproject.toml").read_text()).get("project", {})
         declared = project.get("license")
+        if isinstance(declared, dict) and "text" in declared:
+            declared = declared["text"]
         if isinstance(declared, str) and declared != result["identifier"]:
             scanner.add("tree", "license", "license-metadata-mismatch", "pyproject.toml", value=declared)
         if "dynamic" in project and any(x in project["dynamic"] for x in ("dependencies", "license")):
             scanner.add("tree", "license", "dynamic-license-or-dependencies", "pyproject.toml")
+    if (repo / "package.json").exists():
+        package = json.loads((repo / "package.json").read_text())
+        declared = package.get("license") if isinstance(package, dict) else None
+        if isinstance(declared, str) and declared != result["identifier"]:
+            scanner.add("tree", "license", "license-metadata-mismatch", "package.json", value=declared)
+    apache_attribution_audit(repo, scanner)
     # Unknown ecosystems do not become a false green.
     for name in ("package.json", "Cargo.toml", "go.mod", "pom.xml", "Gemfile", "composer.json", "build.gradle", "build.gradle.kts", "Package.swift", "environment.yml", "Pipfile", "setup.py", "setup.cfg"):
         if (repo / name).exists():
@@ -1364,6 +1490,9 @@ def format_text(report: dict) -> str:
     if dispositions:
         lines += ["", "OWNER LICENSE DISPOSITIONS (no installed license file)"]
         lines += ["   " + json.dumps(item, sort_keys=True) for item in dispositions]
+    if target.get("license", {}).get("owner_disposition"):
+        lines += ["", "OWNER UPSTREAM LICENSE DISPOSITION (verbatim file evidence)",
+                  "   " + json.dumps(target["license"]["owner_disposition"], sort_keys=True)]
     lines += ["", "PLAN"]
     for number, step in enumerate(report.get("plan", []), 1):
         lines.append(f" {number}. [{step['actor']}, {step['status']}] {step['text']}")
@@ -1540,6 +1669,12 @@ def main(argv: list[str] | None = None) -> int:
                             export_report["findings"].extend(finding_scanner.findings)
                             export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
                             export_report["ready"] = False
+            finding_scanner = Scanner(terms)
+            apache_attribution_audit(repo, finding_scanner, target, "export")
+            if finding_scanner.findings:
+                export_report["findings"].extend(finding_scanner.findings)
+                export_report["counts"]["license"] = export_report["counts"].get("license", 0) + len(finding_scanner.findings)
+                export_report["ready"] = False
             export_report["commit"] = git(target, "rev-parse", "HEAD").strip().decode("ascii")
             for finding in export_report['findings']:
                 finding['origin'] = 'export'

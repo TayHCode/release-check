@@ -2,6 +2,18 @@
 
 All notable changes are recorded here, following Keep a Changelog.
 
+## 0.3.0 - 2026-10-10
+
+- Record a narrowly scoped owner disposition for the three exact upstream
+  engineering-notebook term variants, bound to upstream commit and file hash.
+  Other modified terms and missing or mismatched evidence remain blocked.
+
+- Recognize canonical Apache-2.0 terms by normalized hash, with standard optional
+  appendix and applied copyright-notice variants. Modified terms remain blocked.
+- Check Python legacy/string and package metadata for license mismatches.
+- Retain observed Apache upstream notices and copyright in source and exports.
+  Existing MIT policy, privacy rules and digest/clean verdict protections remain.
+
 ## Unreleased (v0.2.1)
 
 - Recognize additional permissive SPDX identifiers and their expressions.
