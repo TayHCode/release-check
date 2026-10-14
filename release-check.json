@@ -1,109 +1,10 @@
 {
-  "exclude": [],
-  "approvals": [
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "release_check.py",
-      "fingerprint": "a541acfac2e64958",
-      "reason": "The detector's own path pattern text, not a user's home directory."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "release_check.py",
-      "fingerprint": "a541acfac2e64958",
-      "reason": "The detector's own path pattern text, not a user's home directory."
-    },
-    {
-      "scope": "tree",
-      "kind": "home-path",
-      "path": "release_check.py",
-      "fingerprint": "b9f44d4003eb7eda",
-      "reason": "The detector's own path pattern text, not a user's home directory."
-    },
-    {
-      "scope": "history",
-      "kind": "home-path",
-      "path": "release_check.py",
-      "fingerprint": "b9f44d4003eb7eda",
-      "reason": "The detector's own path pattern text, not a user's home directory."
-    },
-    {
-      "scope": "tree",
-      "kind": "email",
-      "path": "release_check.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "The detector's own syntax for a public Git hosting SSH reference."
-    },
-    {
-      "scope": "history",
-      "kind": "email",
-      "path": "release_check.py",
-      "fingerprint": "3de132cd98be7bf2",
-      "reason": "The detector's own syntax for a public Git hosting SSH reference."
-    },
-    {
-      "scope": "tree",
-      "kind": "ipv6",
-      "path": "release_check.py",
-      "fingerprint": "71546855d6279ef7",
-      "reason": "The detector's address syntax and dependency classifier punctuation."
-    },
-    {
-      "scope": "history",
-      "kind": "ipv6",
-      "path": "release_check.py",
-      "fingerprint": "71546855d6279ef7",
-      "reason": "The detector's address syntax and dependency classifier punctuation."
-    },
-    {
-      "scope": "tree",
-      "kind": "tailnet-ip",
-      "path": "release_check.py",
-      "fingerprint": "4b2228c26597aeca",
-      "reason": "The detector's published overlay-network range, not a machine address."
-    },
-    {
-      "scope": "history",
-      "kind": "tailnet-ip",
-      "path": "release_check.py",
-      "fingerprint": "4b2228c26597aeca",
-      "reason": "The detector's published overlay-network range, not a machine address."
-    },
-    {
-      "scope": "tree",
-      "kind": "email",
-      "path": "README.md",
-      "fingerprint": "551a8fa62e5a265d",
-      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
-    },
-    {
-      "scope": "tree",
-      "kind": "email",
-      "path": "README.md",
-      "fingerprint": "fc9794e5a27489a0",
-      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
-    },
-    {
-      "scope": "history",
-      "kind": "email",
-      "path": "README.md",
-      "fingerprint": "551a8fa62e5a265d",
-      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
-    },
-    {
-      "scope": "history",
-      "kind": "email",
-      "path": "README.md",
-      "fingerprint": "fc9794e5a27489a0",
-      "reason": "The documented exact GitHub public noreply address form uses a generic username, not a person's address."
-    }
-  ],
+  "exclude": [".scratch/", "*.egg-info"],
+  "approvals": [],
   "quickstart": [
     {
       "file": "README.md",
-      "line": 107,
+      "line": 16,
       "argv": [
         "python",
         "-m",
@@ -114,10 +15,18 @@
     },
     {
       "file": "README.md",
-      "line": 108,
+      "line": 17,
       "argv": [
         "release-check",
         "--help"
+      ]
+    },
+    {
+      "file": "README.md",
+      "line": 23,
+      "argv": [
+        "release-check",
+        "--requirements"
       ]
     }
   ],
@@ -131,10 +40,24 @@
         "discover",
         "-s",
         "tests",
+        "-p",
+        "test_audit_rework.py",
+        "-k",
+        "_cli_",
+        "-v"
+      ]
+    },
+    {
+      "role": "tests",
+      "argv": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
         "-q"
-      ],
-      "file": "README.md",
-      "line": 629
+      ]
     },
     {
       "role": "syntax",

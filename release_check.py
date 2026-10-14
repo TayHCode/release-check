@@ -7,9 +7,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
-import html
-import io
-import ipaddress
+import inspect
 import json
 import math
 import os
@@ -21,192 +19,64 @@ import signal
 import subprocess
 import sys
 import tempfile
-if sys.version_info < (3, 11):
-    version = ".".join(str(part) for part in sys.version_info[:3])
-    message = f"release-check needs Python 3.11 or newer; you have {version}. See README Quickstart for the no-admin uv/Python 3.12 route."
-    if "--json" in sys.argv[1:]:
-        print(json.dumps({"ready": False, "error": "audit-incomplete", "code": "python-version", "verdict": "INCOMPLETE", "message": message}), file=sys.stderr)
-    else:
-        print(message, file=sys.stderr)
-    raise SystemExit(2)
 import tomllib
-import tokenize
 import unicodedata
 
-VERSION = "0.3.0"
-PASS_LIMITATIONS = "This is not a complete secret scanner. Encoded, split or obfuscated secrets or personal data may be missed, as may unlisted names. Run a dedicated secret scanner too and read the export yourself before publishing."
-BLOCKED_EXPORT_WARNING = "EXPORT BLOCKED: the requested destination was not created. The *.BLOCKED folder is a plain private folder, not a Git repository, and may contain credentials or personal data. Read README-BLOCKED.txt. Do not publish it or run git init in it; delete it after fixing the source, then export to a new folder."
-AUDIT_RECORD = "release-check-audit.json"
-BLOCKED_README = "README-BLOCKED.txt"
-MISSING_EXECUTABLE_OUTPUT = b"Declared executable was not found in the verification environment."
+VERSION = "0.4.0"
 MEDIA = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mov", ".wav", ".mp3", ".heic"}
 GENERATED = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build"}
-DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "*.env", ".npmrc", "id_rsa*", "id_ed25519*", "id_dsa*", "id_ecdsa*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*token.json", ".git-credentials", ".netrc", ".pgpass", ".htpasswd", "kubeconfig", ".pypirc", "*.jks", "*.keystore", "terraform.tfstate", "*.tfstate", ".docker/config.json", "keystore.properties", ".kube/config"]
-EXPORT_CONFIG = b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = true\n"
-PATTERNS = {
-    "email": r'''(?<![\w.+-])(?:[\w.+-]+|"[^"\r\n]+")@[\w.-]+\.[a-zA-Z]{2,}(?![\w.-])''',
-    "phone": r"(?<!\w)(?:(?:\+|00)\d(?:[ .-]?\d){7,14}|[2-9]\d{9}|0\d{3,4}[ .-]\d{6}|(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4})(?!\w)",
-    "home-path": r"(?:/(?:mnt/home|home|Volumes)/[^/\s\"'<>]+|/Users/[^/\s\"'<>]+|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"'<>]+|\\\\[\w.-]+\\home\\[^\\/\s\"'<>]+|(?<![\w~])~[A-Za-z0-9_.-]+/)",
-    "tailnet-host": r"\b[\w.-]+\.ts\.net\b",
-    "mac-address": r"(?<![\w:.-])(?:[0-9a-f]{2}(?::[0-9a-f]{2}){5}|[0-9a-f]{2}(?:-[0-9a-f]{2}){5}|[0-9a-f]{4}(?:\.[0-9a-f]{4}){2})(?![\w:.-])|(?i:\b(?:MAC|NIC)\s+([0-9a-f]{12})\b)",
-    "internal-host": r"(?<![\w.-])(?:[\w-]+(?:\.[\w-]+)*\.(?:internal|local|lan|corp|intranet|private|test|localdomain|home(?:\.arpa)?)(?:\.[\w-]+)*|[a-z][a-z-]*-\d{2})(?![\w.-]|\()|\\\\[\w.-]+\\[\w$.-]+",
-    "private-repo-url": r"(?:https?://|git@)(?:gitlab|github|git|gitea)\.(?:internal|local|lan|corp)[^\s\"'<>]*",
-}
+ROOT_LICENSE_FILES = ("LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING")
+REQUIRED_DOCUMENTS = ("README.md", "CONTRIBUTING.md", "SECURITY.md")
+README_HEADINGS = ("limitations", "known issues", "where it fails")
+ISSUE_TEMPLATE_DIR = ".github/ISSUE_TEMPLATE"
+ISSUE_TEMPLATE_GLOBS = ("*.y*ml", "*.md")
+TEST_DIR, TEST_GLOB = "tests", "test*.py"
+CHECK_ROLES = ("quickstart", "tests", "lint", "types", "build", "syntax")
+CONFIGURED_CHECKS = (("ruff", "lint"), ("mypy", "types"))
+DEPENDENCY_LICENSE_FILE = r"^(?:LICEN[CS]E|COPYING|COPYRIGHT|NOTICE|UNLICENSE).*"
+MANIFEST_KEYS = ("exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses")
+DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*token.json", ".close_idle_tabs_state.json"]
 SECRET_PATTERNS = {
     "private-key": r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
     "github-token": r"\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255})\b",
     "aws-key": r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
-    "api-key": r"\b(?:sk-(?:proj-|ant-api\d+-)?(?=[A-Za-z0-9_-]*[A-Z0-9])[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|xox[baprs]-[A-Za-z0-9-]{15,})\b",
+    "api-key": r"\b(?:sk-(?:proj-)?[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,}|xox[baprs]-[A-Za-z0-9-]{15,})\b",
     "jwt": r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b",
-    "credential-url": r"[a-z][a-z0-9+.-]*://(?:[^\s/:@]*:[^\s/@]+|[^\s/:@]{20,})@[^\s]+",
-    "assigned-secret": r'''(?i)(?<![\w-])["']?[a-z0-9_-]*(?:password|passwd|pass|pwd|secret|token|credential|auth|private[_-]?key|access[_-]?key|api[_-]?key|key|client[_-]?key[_-]?data|certificate[_-]?key[_-]?data|private[_-]?key[_-]?id)["']?\s*(?::|=(?!=))\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s"',;}\]]+)''',
-    "provider-token": r"\b(?:glpat-[A-Za-z0-9_-]{20,}|shp(?:at|ca)_[a-fA-F0-9]{32}|sq0(?:atp|csp)-[A-Za-z0-9_-]{20,}|dop_v1_[a-fA-F0-9]{64}|key-[a-fA-F0-9]{32}|(?:SK|AC)[a-fA-F0-9]{32}|\d{6,12}:AA[A-Za-z0-9_-]{33,35}|[a-fA-F0-9]{32}-us\d+|(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{20,}|whsec_[A-Za-z0-9]{20,}|SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,})(?![A-Za-z0-9_-])",
-    "basic-auth": r"(?i)\bBasic\s+[A-Za-z0-9+/=]{8,}",
-    "curl-auth": r'''(?i)\bcurl\b[^\r\n]*?\s(?:-u|--user)(?:\s+|=)["']?[^\s:"']+:[^\s"']+''',
-    "cli-secret": r'''(?i)(?:--(?:password|passwd|pwd|secret|token|credential|auth|api[-_]key)(?:\s+|=)|\bsshpass\s+-p\s*|\bmysql\b[^\r\n]*?\s-p|(?<![\w-])-p(?=[A-Za-z0-9+/=_-]{8,}\b))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';]+)''',
-    "xml-secret": r"(?i)<(?:password|passwd|pass|pwd|secret|token|credential|auth|private[_-]?key|access[_-]?key|api[_-]?key)>([^<\r\n]+)</",
-    "prose-secret": r'''(?i)\b(?:password|passwd|pass|pwd|secret|token|credential|auth|key)\s+(?:is\s+)?("[^"\r\n]*"|'[^'\r\n]*'|[^\s"'<>;]+)''',
-    "password-hash": r"\$(?:apr1|2[aby]|6)\$[^\s\"']+",
-    "pgpass": r"(?m)^[^:#\s]+:(?:\d+|\*):[^:\s]+:[^:\s]+:[^\s]+$",
-    "netrc-password": r'''(?i)(?:\b(?:machine|login)\s+[^\r\n]+?\bpassword\s+|^\s*password\s+)(?!is\s|[:=])("[^"\r\n]*"|'[^'\r\n]*'|\S+)''',
-    "context-secret": r"(?<![\w])[a-fA-F0-9]{32}(?![\w])",
-
-    "webhook-url": r"https://(?:hooks\.slack\.com/services/[A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9_-]+|(?:discord(?:app)?\.com)/api(?:/v\d+)?/webhooks/\d+/[A-Za-z0-9_-]+|[\w.-]+\.webhook\.office\.com/webhookb2/[^\s\"'<>]+)",
+    "credential-url": r"(?:https?|postgres(?:ql)?|mysql|redis)://[^\s/:]+:[^\s/@]+@[^\s]+",
+    "assigned-secret": r"(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token)\s*[:=]\s*[\"']?([^\s\"',;\}\]]{8,})",
     "bearer": r"(?i)\bBearer\s+([A-Za-z0-9._~+/-]{16,})",
 }
+# A numeric version suffix (for example, python@3.11) is not an email TLD.
+EMAIL_PATTERN = r"(?i)(?<![\w.+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)*\.[A-Z](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
+HOME_PATH_PATTERN = r"(?<![A-Za-z0-9._-])/(?:home|Users)/([A-Za-z0-9._-]+)(?=/|(?=$|[\s,;:]))"
 
 
-ROLES = {"quickstart", "tests", "lint", "types", "build", "syntax"}
-GROUPS = [
-    ("private terms", lambda f: f["kind"] == "denylist"),
-    ("emails", lambda f: f["kind"] == "email"),
-    ("IP addresses", lambda f: f["kind"] in {"ipv4", "ipv6", "tailnet-ip", "mac-address"}),
-    ("internal host names", lambda f: f["kind"] in {"internal-host", "tailnet-host"}),
-    ("home paths", lambda f: f["kind"] == "home-path"),
-    ("credentials", lambda f: f["category"] == "secrets"),
-    ("phone numbers", lambda f: f["kind"] == "phone"),
-    ("private repository references", lambda f: f["kind"] == "private-repo-url"),
-    ("license and attribution", lambda f: f["category"] == "license"),
-    ("verification", lambda f: f["scope"] == "verification"),
-    ("documentation and tests", lambda f: f["category"] == "quality"),
-    ("media and binary files", lambda f: f["category"] == "media"),
-    ("scan coverage", lambda f: f["category"] == "coverage"),
-]
-HISTORY_FIX = "This is in old commits or commit metadata and cannot be fixed by editing files. Make a one-commit copy with --export, then scan and verify that copy."
-FIXES: dict[str, str] = {
-    "denylist": "Remove or replace the private term at this line. Term hits cannot be approved.",
-    "email": "Remove the address or replace it with a role address you want public. If it is a deliberate public example, approve it in release-check.json.",
-    "phone": "Remove the number, or approve it in release-check.json if it is a deliberate example.",
-    "ipv4": "Replace the address with a documentation address or a placeholder. Approve loopback or documentation addresses in release-check.json.",
-    "ipv6": "Replace the address with a documentation address or a placeholder. Approve loopback or documentation addresses in release-check.json.",
-    "tailnet-ip": "Replace the address with a documentation address or a placeholder. Approve loopback or documentation addresses in release-check.json.",
-    "mac-address": "Remove the hardware address or approve this exact deliberate example in release-check.json.",
-    "internal-host": "Replace the host name with a placeholder. Approve it in release-check.json only if it is not a real machine.",
-    "tailnet-host": "Replace the host name with a placeholder. Approve it in release-check.json only if it is not a real machine.",
-    "home-path": "Replace the path with a relative path or a placeholder.",
-    "private-repo-url": "Remove the reference to the private repository.",
-    **dict.fromkeys(SECRET_PATTERNS, "Remove the credential and revoke it at the provider. Deleting the text does not make it safe. Credential findings cannot be approved."),
-    "entropy": "This looks like a random secret. Remove it, or split it so it no longer looks like one. It cannot be approved.",
-    "credential-file": "Do not ship this file. Delete it or add it to the manifest exclusions, and revoke anything it held.",
-    "manual-review": "Open the file, check what it shows and its embedded metadata, then approve this exact file in release-check.json.",
-    "binary-review": "The tool cannot read this file. Confirm it must ship, then approve this exact file or exclude it.",
-    "lfs-content-not-scanned": "Large-file content is stored elsewhere and was not scanned. Replace the pointer with the real file or exclude it.",
-    "symlink": "Links are never followed or exported. Replace the link with a real file or remove it.",
-    "unreadable": "The file could not be read. Fix its permissions or remove it.",
-    "missing-tracked-file": "A tracked file is missing from the folder. Restore it or commit its removal.",
-    "shallow-history": "The clone has partial history. Use a full clone so old commits can be scanned.",
-    "no-commits": "The repository has no commits. Commit the files first.",
-    "submodule": "Submodules are not scanned or exported. Remove the submodule or vendor the code with its license.",
-    "unsupported-file": "This entry is not a regular file and was left out of the export. Replace it with a regular file or remove it.",
-    "missing-license": "Add a LICENSE file. Only standard MIT or canonical Apache-2.0 text passes automatically.",
-    "unrecognized-or-modified-license": "Restore standard MIT or canonical Apache-2.0 wording. Other or modified license terms do not pass automatically.",
-    "invalid-license-owner-disposition": "Supply the exact reviewed upstream URL, full commit, verbatim LICENSE hash and three differences. Keep the upstream file unchanged; malformed or mismatched dispositions block.",
-    "license-metadata-mismatch": "Make the license field in pyproject.toml match the LICENSE file.",
-    "dynamic-license-or-dependencies": "Declare the license and dependencies as fixed values in pyproject.toml.",
-    "dependency-ecosystem-manual-review": "This tool can only check Python dependency licenses. Review this ecosystem's dependency licenses by hand.",
-    "vendored-attribution-review": "Confirm every vendored project keeps its license and notice.",
-    "excluded-attribution": "A license or notice file is excluded from the export. Remove that exclusion.",
-    "dependency-license-review": "This dependency's license is unknown, incompatible or lacks a license file. Replace it or record evidence under dependency_licenses.",
-    "dependency-metadata-failed": "Installed package metadata could not be read. Check that the project installs cleanly.",
-    "historical-attribution-missing": "A license or notice file from history is missing. Restore it.",
-    "historical-attribution-changed": "Attribution text from history was removed. Restore the original lines.",
-    "missing-document": "Create this file. A README says what the tool does, how to install it, one usage example and its limitations.",
-    "missing-issue-templates": "Add a Markdown issue template (.md) or YAML issue form (.yml or .yaml) under .github/ISSUE_TEMPLATE.",
-    "missing-limitations": "Add a README heading that contains \"Limitations\" and say plainly where the tool fails.",
-    "missing-tests": "Add at least one test file matching tests/test*.py.",
-    "quickstart-not-declared": "List the README install and first-run commands under quickstart in release-check.json.",
-    "test-command-not-declared": "Add a check with role \"tests\" to release-check.json.",
-    "configured-check-not-declared": "A lint or type tool is configured but has no matching check in release-check.json. Add it.",
-    "verification-not-configured": "Declare quickstart and checks in release-check.json so they can be run.",
-    "verification-not-run": "Run again with --verify to execute the declared commands in a clean clone.",
-    "quickstart-document-mismatch": "The command in release-check.json differs from that line of the document. Make them identical.",
-    "quickstart-document-missing": "The document named in the quickstart entry does not exist. Create it or correct the entry.",
-    "venv-creation-failed": "Verification could not create a venv; quickstart and tests did not run. No-admin fix: install uv into your home using the official script and re-run --verify, or use --verify-no-venv if the manifest declares stdlib_only. Details: Linux/macOS: curl -LsSf https://astral.sh/uv/install.sh | sh; Windows PowerShell: powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\". Follow the installer PATH instructions, then re-run the same command. Verification tried python -m venv, available uv venv and virtualenv with pip. An administrator can install the matching python3-venv package on Debian/Ubuntu, Python via Homebrew on macOS, or Python via winget on Windows. This run did not execute the quickstart or tests.",
-    "no-venv-not-stdlib": "--verify-no-venv requires stdlib_only: true in the manifest and no declared project dependencies. Use --verify for projects that install packages.",
-    "command-not-found": "A declared executable was not found in the fresh verification environment. Install the required tool in an earlier quickstart step, or correct the command in release-check.json.",
-    "command-failed": "A declared command failed in the clean clone. Run it yourself in a fresh clone to see why.",
-    "project-not-installed": "The quickstart did not install the project. Make the first quickstart command install it.",
-    "export-content-mismatch": "A file changed while it was being exported. Export again into a new folder.",
-    "audit-incomplete": "The audit stopped early. Fix the stated problem and run again."
-}
+def placeholder_email(address: str, line: str) -> bool:
+    local, _, domain = address.casefold().rpartition("@")
+    if domain in {"example.com", "example.org", "example.net"} or domain.endswith((".example.com", ".example.org", ".example.net")):
+        return True
+    if domain in {"users.noreply.github.com", "noreply.github.com"}:
+        return True
+    return local in {"git", "noreply", "no-reply"}
 
 
-ERRORS: dict[str, str] = {
-    "export-not-clean": "The export folder is not a single clean commit. Export again into a new folder.",
-    "denylist-required": "Pass --denylist FILE or set RELEASE_CHECK_DENYLIST. The README shows how to make the file.",
-    "denylist-not-found": "The private-terms file does not exist.",
-    "denylist-schema": "The private-terms file is empty or not in a supported format. Private-term coverage is INCOMPLETE: no real private terms were configured. Add your own private terms outside the source repository.",
-    "denylist-example": "Private-term coverage is INCOMPLETE: placeholder/example terms remain; no real private terms are configured in an all-example list. Replace every shipped placeholder with your own private terms outside the source repository, then run again.",
-    "denylist-json": "The private-terms file is not valid JSON. Correct the JSON syntax and run again.",
-    "denylist-encoding": "The private-terms file must be UTF-8 (an optional UTF-8 BOM is accepted). Save it as UTF-8, not UTF-16 or a legacy encoding.",
-    "denylist-inside-source": "Keep the private-terms file outside the repository being audited.",
-    "reports-inside-source": "Choose a reports folder outside the repository being audited.",
-    "repo-not-found": "The repository folder does not exist.",
-    "not-a-git-repository": "That folder is not a git repository.",
-    "not-repository-root": "Point at the top folder of the repository, not a folder inside it.",
-    "manifest-not-found": "The requested --manifest file does not exist.",
-    "manifest-schema": "The manifest is unreadable or invalid JSON/schema. Check --manifest or release-check.json against the README fields.",
-    "manifest-encoding": "The manifest must be UTF-8 (an optional UTF-8 BOM is accepted). Save release-check.json or --manifest as UTF-8, not UTF-16 or a legacy encoding.",
-    "manifest-path": "Manifest exclusions must be relative paths inside the repository.",
-    "export-destination-exists": "The export folder already exists. Choose a new, empty path.",
-    "export-inside-source": "Put the export outside the repository being audited.",
-    "export-parent-of-source": "The export folder cannot contain the repository being audited.",
-    "export-contains-denylist": "The export folder cannot contain the private-terms file.",
-    "invalid-timeout": "--timeout must be 1 or more.",
-    "command-role": "The manifest has an invalid command role.",
-    "command-schema": "The manifest has an invalid command entry.",
-    "quickstart-document-path": "The manifest has an invalid quickstart document path.",
-    "invalid-digest": "--check-digest needs the 64-character digest from the report.",
-    "invalid-arguments": "Run release-check --help.",
-    "audit-incomplete": "The audit could not finish. Nothing was verified."
-}
+def placeholder_home(name: str) -> bool:
+    return name.casefold() in {"user", "you", "name"}
 
 
 class AuditError(Exception):
-    """Errors use a fixed code; only deliberate diagnostics may add details."""
-
-    def __init__(self, code: str, detail: str | None = None):
-        super().__init__(code)
-        self.detail = detail
+    """Errors use a generic code, never exception contents."""
 
 
 class PrivateParser(argparse.ArgumentParser):
     def error(self, message):
         # argparse normally includes the offending argument, which may be a secret.
-        print_error("invalid-arguments", self.json_mode)
+        print('{"ready":false,"error":"invalid-arguments"}', file=sys.stderr)
         raise SystemExit(2)
 
-
-def print_error(code: str, json_mode: bool, detail: str | None = None):
-    if json_mode:
-        error = {"ready": False, "error": "audit-incomplete", "code": code}
-        if code == 'denylist-example':
-            error.update(verdict='INCOMPLETE', message=ERRORS[code])
-        if detail:
-            error["message"] = ERRORS[code] + " " + detail
-        print(json.dumps(error), file=sys.stderr)
-    else:
-        print(f"release-check {VERSION}\nVERDICT: INCOMPLETE\nReason: {code} - {ERRORS[code]}" + (" " + detail if detail else ""), file=sys.stderr)
+    def configuration_error(self, message):
+        print(json.dumps({"ready": False, "error": "missing-configuration", "message": message}), file=sys.stderr)
+        raise SystemExit(2)
 
 
 def fingerprint(value: str | bytes) -> str:
@@ -222,62 +92,11 @@ def opaque_secret(value: str) -> bool:
     return entropy >= 4.3 and bool(re.search(r"[a-z]", value) and re.search(r"[A-Z]", value) and re.search(r"\d", value))
 
 
-class Terms(list):
-    """Terms retain input order; optional domain entries remain private too."""
-    internal_domains: list[str]
-
-
-def normalize(text: str) -> str:
-    return re.sub(r"[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]", "", unicodedata.normalize("NFKC", text))
-
-
-def term_pattern(term: str) -> str:
-    term = normalize(term)
-    parts = re.split(r"[\s_\-\u2010-\u2015]+", term)
-    pattern = r"[\s_\-\u2010-\u2015]*".join(re.escape(p) for p in parts if p)
-    if len(term) <= 3 and term.isalnum():
-        pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
-    return pattern
-
-
-def normalize_personal(line: str) -> str:
-    line = html.unescape(re.sub(r"%([a-fA-F0-9]{2})", lambda m: chr(int(m.group(1), 16)), line))
-    line = re.sub(r"\s*(?:\[at\]|\(at\))\s*", "@", line, flags=re.I)
-    line = re.sub(r"\s*(?:\[dot\]|\(dot\))\s*", ".", line, flags=re.I)
-    line = line.replace("[.]", ".")
-    return re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", line)
-
-
-def host_example(value: str) -> bool:
-    return bool(re.fullmatch(r"(?i)(?:macos|node|utf|sha|base|iso)-\d+", value)
-                or re.fullmatch(r"(?i)(?:self|ctx|this|config|request)\.(?:local|internal|home)", value)
-                or re.search(r"(?i)\.(?:local|internal|home)\.(?:json|toml|ini|yaml|yml|py|js|ts|cfg)$", value))
-
-
-def integrity_value(line: str, value: str, path: str) -> bool:
-    if re.fullmatch(r"sha(?:256|384|512)-[A-Za-z0-9+/=]+", value):
-        return True
-    # Only recognised hash fields are exempt, never arbitrary lockfile contents.
-    lock = Path(path).name in {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock", "Pipfile.lock", "Cargo.lock"}
-    return lock and bool(re.search(r"(?i)(?:integrity|checksum|hash|sha256)\s*[\"']?\s*[:=]", line)) and bool(re.fullmatch(r"(?:sha(?:256|384|512)[:-])?[A-Za-z0-9+/=]+", value))
-
-
 def load_terms(path: Path) -> list[str]:
     """Accept JSON arrays, {terms: [...]}, category-based JSON, or newline lists."""
-    if not path.is_file():
-        raise AuditError("denylist-not-found")
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except UnicodeError:
-        raise AuditError("denylist-encoding") from None
-    domains = []
+    raw = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".json" or raw.lstrip().startswith(("[", "{")):
-        try:
-            obj = json.loads(raw)
-        except json.JSONDecodeError as error:
-            raise AuditError("denylist-json", f"Syntax error at line {error.lineno}, column {error.colno}.") from None
-        if isinstance(obj, dict):
-            domains = obj.get("internal_domains", [])
+        obj = json.loads(raw)
         if isinstance(obj, list):
             terms = obj
         elif isinstance(obj, dict) and isinstance(obj.get("terms"), list):
@@ -295,20 +114,12 @@ def load_terms(path: Path) -> list[str]:
         terms = [line.strip() for line in raw.splitlines() if line.strip() and not line.startswith("#")]
     if not terms or any(not isinstance(t, str) or not t.strip() for t in terms):
         raise AuditError("denylist-schema")
-    normalized = [re.sub(r"[\s_-]+", " ", normalize(t).strip().casefold()) for t in terms]
-    if (any(t.startswith("replace with ") for t in normalized)
-            or all(t in {"example", "placeholder", "your name", "your username", "your employer", "your machine", "your town"} for t in normalized)):
-        raise AuditError("denylist-example")
-    if not isinstance(domains, list) or any(not isinstance(d, str) or not re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+", d) for d in domains):
-        raise AuditError("denylist-schema")
-    result = Terms(terms)
-    result.internal_domains = [d.lower() for d in domains]
-    return result
+    return terms
 
 
 def git(repo: Path, *args: str) -> bytes:
     environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    environment.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_OPTIONAL_LOCKS="0", TZ="UTC")
+    environment.update(GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_OPTIONAL_LOCKS="0")
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=environment)
     if result.returncode:
         raise AuditError("git-read-failed")
@@ -326,56 +137,6 @@ def match_path(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, p) or fnmatch.fnmatchcase(Path(path).name, p) or path == p.rstrip("/") or path.startswith(p.rstrip("/") + "/") for p in patterns)
 
 
-def credential_file(path: str) -> bool:
-    name = Path(path).name.lower()
-    nested = any(path.lower().endswith("/" + special) for special in (".docker/config.json", ".kube/config"))
-    return nested or match_path(path.lower(), DEFAULT_EXCLUDES[1:]) or bool(re.search(r"(?:^|[_.-])(?:tokens?|credentials|id_rsa|id_ed25519|id_dsa|id_ecdsa)(?:[_.-]|$)", name))
-
-
-def literal_secret(match: re.Match, line: str, path: str, in_literal: bool = False) -> str | None:
-    value = match.group(1)
-    quoted = value.startswith(('"', "'"))
-    if not quoted and re.match(r"<[^>\r\n]*>", line[match.start(1):]):
-        return None
-    if quoted:
-        value = value[1:-1]
-    if not value or re.fullmatch(r"(?i)(?:change[_-]?me|your[_-].*|example|example[_-](?:key|token|password)|placeholder.*|dummy|xxx+|\.{3,}|<[^>]*>)", value):
-        return None
-    if not quoted and value in {"None", "null", "true", "false"}:
-        return None
-    if re.match(r"(?:os\.environ(?:\[|\.get\()|os\.getenv\(|process\.env(?:\.|\[)|env\(|\$\{)", value):
-        return None
-    if not quoted and not in_literal and Path(path).suffix == ".py" and value.startswith(("(", "[")):
-        return None
-    if not quoted and not in_literal and Path(path).suffix == ".py" and ")" in line[match.start(1):] and re.match(r"[a-zA-Z_]\w*(?:\.\w+)*\(", value):
-        return None
-    if not quoted and line[match.end():].startswith(('"', "'")) and (not in_literal or value.lower() in {"r", "b", "f", "u", "rb", "br", "rf", "fr"}):
-        return None
-    if re.match(r'''(?i)["']?key["']?\s*[:=]''', match.group()):
-        # A generic key also names public map/license/sort fields. Explicit
-        # password/token labels and provider formats do not get this exemption.
-        if value in {"mit", "other", "unlicense", "unlicensed", "None", "null", "true", "false"} or value.casefold() in {identifier.casefold() for identifier in COMPATIBLE} or re.fullmatch(r"[a-z][a-z0-9-]*-\d+\.\d+(?:-only|-or-later)?", value):
-            return None
-        if not quoted and re.fullmatch(r"[a-z-]{1,19}", value):
-            return None
-    if not quoted and not in_literal and Path(path).suffix == ".py" and re.fullmatch(r"[A-Za-z_]\w*[):]*", value):
-        return None  # Python names and type annotations are references, not literals.
-    if re.match(r"\s*(?:\+|\*|%)", line[match.end():]):
-        return None
-    return value
-
-
-def validate_repo(repo: Path):
-    if not repo.is_dir():
-        raise AuditError("repo-not-found")
-    try:
-        toplevel = Path(os.fsdecode(git(repo, "rev-parse", "--show-toplevel")).strip()).resolve()
-    except AuditError:
-        raise AuditError("not-a-git-repository") from None
-    if toplevel != repo:
-        raise AuditError("not-repository-root")
-
-
 def protected(path: str) -> bool:
     return bool(re.search(r"(?:^|/)(?:LICENSE[^/]*|COPYING[^/]*|NOTICE[^/]*|UPSTREAM[^/]*|THIRD_PARTY[^/]*)$", path, re.I))
 
@@ -383,10 +144,9 @@ def protected(path: str) -> bool:
 class Scanner:
     def __init__(self, terms: list[str], private_repos: list[str] = (), approvals: list[dict] = ()):
         self.terms = terms
-        self.term_patterns = [re.compile(term_pattern(t), re.I) for t in terms]
-        self.internal_domains = getattr(terms, "internal_domains", [])
         self.private_repos = list(private_repos)
         self.approvals = list(approvals)
+        self.matched_approvals: set[int] = set()
         self.findings: list[dict] = []
         self.stats = Counter()
         self.seen = set()
@@ -394,119 +154,83 @@ class Scanner:
     def safe_path(self, path: str) -> str:
         # Paths themselves can contain private terms, emails, IPs or tokens.
         original = path
-        path = normalize(path)
-        if any(re.search(r"(?<![\w.-])(?:[\w-]+\.)*" + re.escape(domain) + r"(?![\w.-])", normalize_personal(path), re.I) for domain in self.internal_domains):
-            return "[path-" + fingerprint(original) + "]"
-        for pattern in self.term_patterns:
-            if pattern.search(path):
+        for term in self.terms:
+            if term.casefold() in path.casefold() or re.search(re.escape(term), path, re.I):
                 return "[path-" + fingerprint(original) + "]"
-        for pattern in [*PATTERNS.values(), *SECRET_PATTERNS.values(), r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"]:
+        for pattern in [*SECRET_PATTERNS.values(), EMAIL_PATTERN, HOME_PATH_PATTERN, r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"]:
             if re.search(pattern, path, re.I):
                 return "[path-" + fingerprint(original) + "]"
         if any(url.casefold() in path.casefold() for url in self.private_repos):
             return "[path-" + fingerprint(original) + "]"
         if re.search(r"[0-9A-Fa-f]*:[0-9A-Fa-f:]+", path):
             return "[path-" + fingerprint(original) + "]"
-        if any(opaque_secret(value) for value in re.findall(r"[A-Za-z0-9_/+=-]{32,}", path)):
+        if any(opaque_secret(value) for value in re.findall(r"[A-Za-z0-9_+=-]{32,}", path)):
             return "[path-" + fingerprint(original) + "]"
-        return original.replace("\n", "[newline]").replace("\r", "[return]").replace("\t", "[tab]")
+        return path.replace("\n", "[newline]").replace("\r", "[return]").replace("\t", "[tab]")
 
-    def add(self, scope: str, category: str, kind: str, path: str, line: int = 0, value: str | bytes = b"", term_index: int | None = None, object_id: str | None = None):
+    def add(self, scope: str, category: str, kind: str, path: str, line: int = 0, value: str | bytes = b"", term_index: int | None = None, object_id: str | None = None, details: dict | None = None):
         item = {"scope": scope, "category": category, "kind": kind, "path": self.safe_path(path), "line": line, "fingerprint": fingerprint(value)}
         if term_index is not None:
             item["term_index"] = term_index
         if object_id:
             item["object"] = object_id
-        # Approvals are specific to category, kind, path, scope and fingerprint.
-        # Denylist hits and credentials can never be waived.
-        item["reviewed"] = category in {"personal", "media"} and kind != "denylist" and any(all(a.get(k) == item[k] for k in ("scope", "kind", "path", "fingerprint")) for a in self.approvals)
+        # Approvals are specific to kind, path, scope and fingerprint.
+        licence_review = category == "license" and kind == "dependency-license-review" and scope == "verification"
+        eligible = category == "media" or licence_review
+        approved = False
+        needs_reason = licence_review
+        for approval_index, approval in enumerate(self.approvals):
+            exact = all(approval.get(k) == item[k] for k in ("scope", "kind", "path", "fingerprint"))
+            reason = approval.get("reason")
+            valid_reason = (not needs_reason or isinstance(reason, str) and bool(reason.strip()) and reason.isprintable()
+                            and not any(term.casefold() in reason.casefold() for term in self.terms))
+            if eligible and exact and valid_reason:
+                self.matched_approvals.add(approval_index)
+                approved = True
+        item["reviewed"] = approved
+        if details:
+            item.update(details)
         key = tuple(sorted(item.items()))
         if key not in self.seen:
             self.seen.add(key)
             self.findings.append(item)
+        return item
 
     def text(self, raw: bytes, scope: str, path: str, object_id: str | None = None):
         self.stats[scope + "_bytes"] += len(raw)
-        # Wide-character media metadata and text files still receive term/secret checks.
+        # UTF-16 media metadata and text files still receive term/secret checks.
         encodings = ["utf-8"]
         if raw.startswith((b"\xff\xfe", b"\xfe\xff")) or (raw and raw.count(b"\0") / len(raw) > .15):
             encodings += ["utf-16-le", "utf-16-be"]
         for encoding in encodings:
-            text = normalize(raw.decode(encoding, errors="replace"))
+            text = raw.decode(encoding, errors="replace")
             for index, term in enumerate(self.terms):
-                for match in self.term_patterns[index].finditer(text):
+                pattern = re.escape(term)
+                if term.isalpha():
+                    pattern = r"(?<!\w)" + pattern + r"(?!\w)"
+                for match in re.finditer(pattern, text, re.I):
                     self.add(scope, "personal", "denylist", path, text.count("\n", 0, match.start()) + 1, match.group(), index, object_id)
-            spans = []
-            if Path(path).suffix == ".py":
-                try:
-                    for token in tokenize.generate_tokens(io.StringIO(text).readline):
-                        if token.type in {tokenize.COMMENT, tokenize.STRING}:
-                            spans.append((token.start, token.end))
-                except (tokenize.TokenError, IndentationError, SyntaxError):
-                    pass
-            lines = text.splitlines()
-            for number, line in enumerate(lines, 1):
-                personal_line = normalize_personal(line)
-                for domain in self.internal_domains:
-                    for match in re.finditer(r"(?<![\w.-])(?:[\w-]+\.)*" + re.escape(domain) + r"(?![\w.-])", personal_line, re.I):
-                        self.add(scope, "personal", "internal-host", path, number, match.group(), object_id=object_id)
-                for kind, pattern in PATTERNS.items():
-                    for match in re.finditer(pattern, personal_line, re.I):
-                        if kind == "email" and re.fullmatch(r"(?:[0-9]+\+)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?@users\.noreply\.github\.com", match.group(), re.I):
-                            continue
-                        if kind == "internal-host" and host_example(match.group()):
-                            continue
-                        self.add(scope, "personal", kind, path, number, match.group(), object_id=object_id)
+            for number, line in enumerate(text.splitlines(), 1):
+                for match in re.finditer(EMAIL_PATTERN, line):
+                    address = match.group()
+                    if not placeholder_email(address, line):
+                        self.add(scope, "personal", "email-address", path, number, address, object_id=object_id)
+                for match in re.finditer(HOME_PATH_PATTERN, line):
+                    if not placeholder_home(match.group(1)):
+                        self.add(scope, "personal", "home-path", path, number, match.group(), object_id=object_id)
                 for url in self.private_repos:
                     # Match HTTPS, SSH and bare owner/repo references to known private repos.
-                    ref = re.sub(r"^(?:https?://github.com/|git@github.com:)", "", url).removesuffix(".git").rstrip("/")
+                    ref = re.sub(r"^(?:https?://github.com/|" r"git@github.com:)", "", url).removesuffix(".git").rstrip("/")
                     for match in re.finditer(re.escape(ref), line, re.I):
                         self.add(scope, "personal", "private-repo-url", path, number, match.group(), object_id=object_id)
-                for candidate in re.finditer(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<![\w:])[0-9A-Fa-f:]*:[0-9A-Fa-f:]+(?:%[\w-]+)?(?![\w:])", personal_line):
-                    value = candidate.group()
-                    if value == "::" and not (candidate.start() > 0 and line[candidate.start() - 1] in "\"'["):
-                        continue  # classifier/prose punctuation, not an address literal
-                    try:
-                        address = ipaddress.ip_address(value)
-                    except ValueError:
-                        continue
-                    kind = "tailnet-ip" if address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10") else "ipv" + str(address.version)
-                    self.add(scope, "personal", kind, path, number, value, object_id=object_id)
-                webhook_spans = [m.span() for m in re.finditer(SECRET_PATTERNS["webhook-url"], line)]
-                data_spans = [m.span() for m in re.finditer(r"data:[^;\s]+;base64,[A-Za-z0-9+/]+={0,2}", line, re.I)]
                 for kind, pattern in SECRET_PATTERNS.items():
                     for match in re.finditer(pattern, line):
-                        position = match.start(1) if kind in {"assigned-secret", "cli-secret", "xml-secret", "prose-secret", "netrc-password"} else match.start()
-                        in_literal = any(start <= (number, position) < end for start, end in spans)
-                        value = literal_secret(match, line, path, in_literal or kind != "assigned-secret") if kind in {"assigned-secret", "cli-secret", "xml-secret", "prose-secret", "netrc-password"} else match.group(match.lastindex or 0)
-                        if kind == "prose-secret" and not re.search(r"\bis\s+", match.group(), re.I) and (len(value or "") < 12 or (len(value or "") < 20 and not re.search(r"password\s+", match.group(), re.I))):
-                            continue
-                        if value is not None:
-                            self.add(scope, "secrets", kind, path, number, value, object_id=object_id)
-                for match in re.finditer(r"(?<![\w+/=-])[A-Za-z0-9_/+=-]{32,}(?![\w+/=-])", line):
-                    value = match.group()
-                    if any(start <= match.start() and match.end() <= end for start, end in webhook_spans + data_spans):
-                        continue
-                    if "/" in value and any(m.start() <= match.start() < m.end() for m in re.finditer(r'''[a-z][a-z0-9+.-]*://[^\s"'<>]+''', line, re.I)):
-                        # Evaluate URL segments separately; concatenating ordinary
-                        # host/path words must not manufacture a base64 secret.
-                        if not any(opaque_secret(part) for part in value.split("/")):
-                            continue
-                    # A hexadecimal content digest is not itself a credential. Explicit
-                    # key formats and labelled secrets above still take precedence.
-                    preceding = lines[number - 2][-40:] if number > 1 else ""
-                    surrounding = line[:match.start()] + " " + line[match.end():]
-                    context_text = re.sub(r"(?<=[a-z])(?=[A-Z])", "_", preceding + "\n" + surrounding)
-                    context = re.search(r"(?i)(?<![a-z])(?:key|token|secret|auth|signing)(?![a-z])", context_text)
-                    if not integrity_value(line, value, path) and (opaque_secret(value) or (context and (re.fullmatch(r"[a-fA-F0-9]{32,}", value) or len(value) >= 40))):
-                        self.add(scope, "secrets", "entropy", path, number, value, object_id=object_id)
+                        self.add(scope, "secrets", kind, path, number, match.group(match.lastindex or 0), object_id=object_id)
 
     def file(self, raw: bytes, scope: str, path: str, object_id: str | None = None):
         self.stats[scope + "_files"] += 1
         self.text(path.encode("utf-8", errors="surrogateescape"), scope, path, object_id)
         self.text(raw, scope, path, object_id)
-        if credential_file(path):
-            self.add(scope, "secrets", "credential-file", path, value=raw, object_id=object_id)
         if Path(path).suffix.lower() in MEDIA:
             self.add(scope, "media", "manual-review", path, value=raw, object_id=object_id)
         elif Path(path).suffix.lower() in {".zip", ".gz", ".tar", ".7z", ".exe", ".dll", ".so", ".sqlite", ".db", ".bin"} or (b"\0" in raw and not raw.startswith((b"\xff\xfe", b"\xfe\xff"))):
@@ -515,17 +239,14 @@ class Scanner:
             self.add(scope, "coverage", "lfs-content-not-scanned", path, value=raw, object_id=object_id)
 
     def tree(self, repo: Path):
-        submodules = submodule_paths(repo)
-        for rel in sorted(submodules):
-            self.add("tree", "coverage", "submodule", rel)
         tracked = {p.decode("utf-8", "surrogateescape") for p in git(repo, "ls-files", "-z").split(b"\0") if p}
         for root, dirs, files in os.walk(repo, followlinks=False):
             relative = Path(root).relative_to(repo)
-            dirs[:] = [d for d in dirs if d != ".git" and (relative / d).as_posix() not in submodules and (d not in GENERATED or any(p.startswith((relative / d).as_posix() + "/") for p in tracked))]
+            dirs[:] = [d for d in dirs if d != ".git" and (d not in GENERATED or any(p.startswith((relative / d).as_posix() + "/") for p in tracked))]
             for name in files + [d for d in dirs if (Path(root) / d).is_symlink()]:
                 path = Path(root) / name
                 rel = path.relative_to(repo).as_posix()
-                if name == ".git" or rel in submodules:
+                if name == ".git":
                     continue
                 if path.is_symlink():
                     raw = os.readlink(path).encode()
@@ -544,8 +265,6 @@ class Scanner:
     def history(self, repo: Path):
         if git(repo, "rev-parse", "--is-shallow-repository").strip() == b"true":
             self.add("history", "coverage", "shallow-history", "@git")
-        self.text(git(repo, "for-each-ref", "--format=%(refname)\n%(taggername)\n%(taggeremail)\n%(contents)"), "metadata", "@refs")
-        self.text(git(repo, "config", "--local", "--list"), "metadata", "@config")
         commits = git(repo, "rev-list", "--all", "--reflog").splitlines()
         self.stats["history_commits"] = len(commits)
         if not commits:
@@ -572,26 +291,22 @@ class Scanner:
                     self.add("history", "coverage", "symlink", rel, value=raw, object_id=oid)
 
 
+def unique_json_object(pairs):
+    """Repeated keys must not discard an earlier licence or gate assertion."""
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError('duplicate-json-key')
+        obj[key] = value
+    return obj
+
+
 def manifest_for(repo: Path, path: Path | None) -> dict:
-    explicit = path is not None
-    path = path.expanduser() if explicit else repo / "release-check.json"
-    if not path.exists() and not path.is_symlink():
-        if explicit:
-            raise AuditError("manifest-not-found")
+    path = path or repo / "release-check.json"
+    if not path.exists():
         return {"exclude": [], "approvals": [], "quickstart": [], "checks": []}
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except UnicodeError:
-        raise AuditError("manifest-encoding") from None
-    except OSError:
-        raise AuditError("manifest-schema") from None
-    try:
-        obj = json.loads(raw)
-    except ValueError:
-        raise AuditError("manifest-schema") from None
-    if not isinstance(obj, dict) or any(k not in {"exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses", "license_owner_disposition", "stdlib_only"} for k in obj):
-        raise AuditError("manifest-schema")
-    if type(obj.get("stdlib_only", False)) is not bool:
+    obj = json.loads(path.read_text(), object_pairs_hook=unique_json_object)
+    if not isinstance(obj, dict) or any(k not in MANIFEST_KEYS for k in obj):
         raise AuditError("manifest-schema")
     for key in ("exclude", "approvals", "quickstart", "checks"):
         obj.setdefault(key, [])
@@ -603,556 +318,789 @@ def manifest_for(repo: Path, path: Path | None) -> dict:
         raise AuditError("manifest-schema")
     if any(not isinstance(p, str) or p.startswith("/") or ".." in Path(p).parts for p in obj["exclude"]):
         raise AuditError("manifest-path")
-    if explicit:
-        validate_commands(obj)
     return obj
 
 
-def validate_commands(manifest: dict):
-    for item in [*manifest["quickstart"], *manifest["checks"]]:
-        if item.get("role", "quickstart") not in ROLES:
-            raise AuditError("command-role")
-        argv = item.get("argv")
-        if not isinstance(argv, list) or not argv or any(not isinstance(a, str) or "\0" in a for a in argv):
-            raise AuditError("command-schema")
-    for item in manifest["quickstart"]:
-        doc = item.get("file", "README.md")
-        if not isinstance(doc, str) or Path(doc).is_absolute() or ".." in Path(doc).parts:
-            raise AuditError("quickstart-document-path")
-
-
-def normalized_license(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def apache_license(text: str) -> bool:
-    """Match ASF/SPDX terms exactly; only wrapping and standard tails vary.
-
-    Sources: https://www.apache.org/licenses/LICENSE-2.0.txt and
-    https://spdx.org/licenses/Apache-2.0.html. The appendix is optional;
-    its identifying copyright fields may be filled in. A standard applied
-    boilerplate notice may replace the instructional appendix.
-    """
-    body, marker, tail = text.partition("END OF TERMS AND CONDITIONS")
-    if not marker or hashlib.sha256(normalized_license(body + marker).encode()).hexdigest() != "59d8f0ba87ad9a2f1a431123c8d16646e5b89ba53653e818f16d136d77263c99":
-        return False
-    if not tail.strip():
-        return True
-    # Only replace the identifying fields, never grant/disclaimer wording.
-    tail = re.sub(r"Copyright (?:\[yyyy\] \[name of copyright owner\]|\d{4}(?:[-, ]\d{4})* [^\r\n]+?)(?=\s+Licensed under the Apache License)",
-                  "Copyright [yyyy] [name of copyright owner]", tail)
-    digest = hashlib.sha256(normalized_license(tail).encode()).hexdigest()
-    return digest in {"15e0e14d590e112dcf1801fb0ca4a74c6178f468147941bfe6840cb55fa84ca4",
-                      "108bfed552130bbe29d30b1526c0c443629be89bb82fd495357b7305db0693a1"}
-
-
-def known_upstream_license(text: str) -> bool:
-    """Identify the normalized, observed upstream file for retention checks only."""
-    return hashlib.sha256(normalized_license(text).encode()).hexdigest() == "a2016109f78ae6b763dd66c84d3fa11c61389c6b787d4b50bc02d2ea9c883a2a"
-
-
-def upstream_license_disposition(path: Path, text: str, manifest: dict) -> dict | None:
-    """Accept only the reviewed upstream's exact three normalized term variants.
-
-    This is recorded owner evidence, not automatic canonical recognition.
-    Hash the verbatim bytes; never rewrite the retained license.
-    """
-    evidence = manifest.get("license_owner_disposition")
-    differences = [
-        {"canonical": "submitted to Licensor", "upstream": "submitted to the Licensor"},
-        {"canonical": "received by Licensor", "upstream": "received by the Licensor"},
-        {"canonical": "within such NOTICE file, excluding those notices",
-         "upstream": "within such NOTICE file, excluding any notices"},
-    ]
-    if (not isinstance(evidence, dict)
-            or set(evidence) != {"reviewed", "spdx", "path", "source_url", "upstream_commit", "sha256", "differences"}
-            or evidence.get("reviewed") is not True
-            or evidence.get("spdx") != "Apache-2.0" or evidence.get("path") != path.name
-            or path.name != "LICENSE"
-            or evidence.get("source_url") != "https://github.com/prime-radiant-inc/engineering-notebook"
-            or evidence.get("upstream_commit") != "b0a34caa4b59e466652572310fd043a9548027c2"
-            or evidence.get("sha256") != "9177a3b208fb5034ae89ec90ed3c1f4192ca6825ef19699f5d62beace22bcbf5"
-            or evidence.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
-            or evidence.get("differences") != differences or not known_upstream_license(text)):
-        return None
-    normalized = normalized_license(text)
-    body, marker, _ = normalized.partition("END OF TERMS AND CONDITIONS")
-    if not marker or hashlib.sha256((body + marker).encode()).hexdigest() != "a14c5bd2f88659c252bbac195ceb4c19e26f829132b552ffbddd26cb8b41a7d8":
-        return None
-    for difference in differences:
-        if normalized.count(difference["upstream"]) != 1:
-            return None
-        normalized = normalized.replace(difference["upstream"], difference["canonical"], 1)
-    return evidence if apache_license(normalized) else None
-
-
-def apache_attribution_audit(repo: Path, scanner: Scanner, destination: Path | None = None, scope: str = "tree"):
-    """Retain observed Apache upstream notices and copyright in local history.
-
-    No remote is consulted. Unknown upstream history remains an owner review.
-    Deleted source files need not retain notices that no longer pertain; the
-    distribution's license and NOTICE files must survive.
-    """
-    if not (repo / ".git").exists():
-        return
-    seen: set[tuple[bytes, bytes]] = set()
-    for commit in git(repo, "rev-list", "--all", "--reflog").splitlines():
-        entries = [entry.split(b"\t", 1) for entry in
-                   filter(None, git(repo, "ls-tree", "-r", "-z", commit.decode()).split(b"\0"))]
-        license_blobs = [metadata.split()[2] for metadata, raw_path in entries
-                         if raw_path.upper() in {b"LICENSE", b"LICENSE.MD", b"LICENSE.TXT", b"COPYING"}
-                         and metadata.split()[1] == b"blob" and metadata.split()[0] != b"120000"]
-        if not any(b"Apache License" in git(repo, "cat-file", "blob", blob.decode()) for blob in license_blobs):
-            continue
-        for metadata, raw_path in entries:
-            mode, kind, blob = metadata.split()
-            if kind != b"blob" or mode == b"120000" or (blob, raw_path) in seen:
-                continue
-            seen.add((blob, raw_path))
-            path = raw_path.decode("utf-8", "surrogateescape")
-            target = (destination or repo) / path
-            attribution_file = protected(path)
-            if not target.is_file() or target.is_symlink():
-                if attribution_file:
-                    scanner.add(scope, "license", "historical-attribution-missing", path, value=metadata)
-                continue
-            old = git(repo, "cat-file", "blob", blob.decode()).decode("utf-8", "replace")
-            current_text = target.read_text(errors="replace")
-            current = normalized_license(current_text)
-            if Path(path).name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"} and apache_license(old) and not apache_license(current_text):
-                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
-            if Path(path).name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"} and known_upstream_license(old) and git(repo, "cat-file", "blob", blob.decode()) != target.read_bytes():
-                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
-            if attribution_file and "NOTICE" in Path(path).name.upper():
-                notices = [line.strip() for line in old.splitlines() if line.strip()]
-            else:
-                notices = re.findall(r"(?im)^[ \t]*(?:[#/*;! -]+[ \t]*)?(Copyright[^\r\n]*)$", old)
-            if any(not re.search(re.escape(normalized_license(notice)) + r"(?!\w)", current) for notice in notices):
-                scanner.add(scope, "license", "historical-attribution-changed", path, value=old)
-
-
 def license_audit(repo: Path, scanner: Scanner, manifest: dict) -> dict:
-    candidates = [p for p in repo.iterdir() if p.name.upper() in {"LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING"}]
+    candidates = [p for p in repo.iterdir() if p.name.upper() in ROOT_LICENSE_FILES]
     result = {"status": "blocked", "identifier": None, "dependencies": "not-verified"}
     if not candidates:
         scanner.add("tree", "license", "missing-license", "LICENSE")
         return result
-    text = candidates[0].read_text(errors="replace")
-    disposition = upstream_license_disposition(candidates[0], text, manifest)
-    if "license_owner_disposition" in manifest and disposition is None:
-        scanner.add("tree", "license", "invalid-license-owner-disposition", candidates[0].name)
-    # Compare all standard MIT grant/disclaimer wording, allowing wrapping and owner/year.
-    canonical_hash = "fe2a9817987f862eaced948f0468c7f51d2fedfc48c5c505b246a49a3870e9a5"
-    normalize = lambda t: re.sub(r"\s+", " ", t[t.find("Permission is hereby granted"):]).strip()
-    if "MIT License" in text and "Permission is hereby granted" in text and hashlib.sha256(normalize(text).encode()).hexdigest() == canonical_hash:
-        result.update(status="pass", identifier="MIT")
-    elif apache_license(text):
-        result.update(status="pass", identifier="Apache-2.0")
-    elif disposition:
-        result.update(status="pass", identifier="Apache-2.0", owner_disposition=disposition)
+    identifiers = [project_license_identifier(decode_licence(p.read_bytes())) for p in candidates]
+    if any(identifier is None for identifier in identifiers) or len(set(identifiers)) != 1:
+        for candidate, identifier in zip(candidates, identifiers):
+            if identifier is None or len(set(identifiers)) != 1:
+                scanner.add("tree", "license", "unrecognized-or-modified-license", candidate.name,
+                            value=decode_licence(candidate.read_bytes()))
     else:
-        scanner.add("tree", "license", "unrecognized-or-modified-license", candidates[0].name, value=text)
+        result.update(status="pass", identifier=identifiers[0])
+    declared_values = []
     project = {}
-    if (repo / "pyproject.toml").exists():
-        project = tomllib.loads((repo / "pyproject.toml").read_text()).get("project", {})
-        declared = project.get("license")
-        if isinstance(declared, dict) and "text" in declared:
-            declared = declared["text"]
-        if isinstance(declared, str) and declared != result["identifier"]:
-            scanner.add("tree", "license", "license-metadata-mismatch", "pyproject.toml", value=declared)
-        if "dynamic" in project and any(x in project["dynamic"] for x in ("dependencies", "license")):
-            scanner.add("tree", "license", "dynamic-license-or-dependencies", "pyproject.toml")
-    if (repo / "package.json").exists():
-        package = json.loads((repo / "package.json").read_text())
-        declared = package.get("license") if isinstance(package, dict) else None
-        if isinstance(declared, str) and declared != result["identifier"]:
-            scanner.add("tree", "license", "license-metadata-mismatch", "package.json", value=declared)
-    apache_attribution_audit(repo, scanner)
-    # Unknown ecosystems do not become a false green.
-    for name in ("package.json", "Cargo.toml", "go.mod", "pom.xml", "Gemfile", "composer.json", "build.gradle", "build.gradle.kts", "Package.swift", "environment.yml", "Pipfile", "setup.py", "setup.cfg"):
-        if (repo / name).exists():
-            scanner.add("tree", "license", "dependency-ecosystem-manual-review", name)
-    for path in repo.glob("*.csproj"):
-        scanner.add("tree", "license", "dependency-ecosystem-manual-review", path.name)
-    if (repo / "pyproject.toml").exists() and "poetry" in tomllib.loads((repo / "pyproject.toml").read_text()).get("tool", {}):
-        scanner.add("tree", "license", "dependency-ecosystem-manual-review", "pyproject.toml")
-    for name in ("vendor", "vendored", "third_party", "third-party"):
-        if (repo / name).is_dir():
-            scanner.add("tree", "license", "vendored-attribution-review", name)
+    pyproject = repo / "pyproject.toml"
+    if pyproject.is_file():
+        project = tomllib.loads(pyproject.read_text()).get("project", {})
+        if project.get("license") is not None:
+            declared = project["license"]
+            if isinstance(declared, dict) and set(declared) == {"text"}:
+                declared = declared["text"]
+            elif isinstance(declared, dict) and set(declared) == {"file"} and isinstance(declared["file"], str):
+                path = Path(declared["file"])
+                if not path.is_absolute() and ".." not in path.parts and (repo / path).is_file() and not (repo / path).is_symlink():
+                    declared = project_license_identifier(decode_licence((repo / path).read_bytes()))
+            declared_values.append(("pyproject.toml", declared))
+    package_json = repo / "package.json"
+    if package_json.is_file():
+        package = json.loads(package_json.read_text())
+        if isinstance(package, dict) and package.get("license") is not None:
+            declared_values.append(("package.json", package["license"]))
+    for path, declared in declared_values:
+        if declared != result["identifier"]:
+            scanner.add("tree", "license", "license-metadata-mismatch", path,
+                        value=json.dumps(declared, sort_keys=True))
     deps = bool(project.get("dependencies") or project.get("optional-dependencies"))
     for path in repo.glob("*requirements*.txt"):
         if any(line.strip() and not line.lstrip().startswith("#") for line in path.read_text().splitlines()):
             deps = True
     if not deps:
         result["dependencies"] = "stdlib-only"
-    # Attribution is never silently discarded, even when an export manifest excludes it.
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d != ".git" and d not in GENERATED]
-        for name in files:
-            rel = (Path(root) / name).relative_to(repo).as_posix()
-            if protected(rel) and match_path(rel, [*DEFAULT_EXCLUDES, *manifest["exclude"]]):
-                scanner.add("tree", "license", "excluded-attribution", rel)
     return result
 
 
 def quality_audit(repo: Path, scanner: Scanner, manifest: dict):
-    for name in ("README.md", "CONTRIBUTING.md", "SECURITY.md"):
+    for name in REQUIRED_DOCUMENTS:
         if not (repo / name).is_file():
             scanner.add("tree", "quality", "missing-document", name)
-    if not any((repo / ".github/ISSUE_TEMPLATE").glob("*.y*ml")) and not any((repo / ".github/ISSUE_TEMPLATE").glob("*.md")):
-        scanner.add("tree", "quality", "missing-issue-templates", ".github/ISSUE_TEMPLATE")
-    try:
-        readme = (repo / "README.md").read_text(encoding="utf-8", errors="replace") if (repo / "README.md").is_file() else ""
-    except OSError:
-        readme = ""
-    if not re.search(r"^#+\s+.*(?:limitations|known issues|where it fails)", readme, re.I | re.M):
+    if not any(any((repo / ISSUE_TEMPLATE_DIR).glob(pattern)) for pattern in ISSUE_TEMPLATE_GLOBS):
+        scanner.add("tree", "quality", "missing-issue-templates", ISSUE_TEMPLATE_DIR)
+    readme = (repo / "README.md").read_text() if (repo / "README.md").exists() else ""
+    if not re.search(r"^#+\s+.*(?:" + "|".join(map(re.escape, README_HEADINGS)) + ")", readme, re.I | re.M):
         scanner.add("tree", "quality", "missing-limitations", "README.md")
-    if not any((repo / "tests").rglob("test*.py")):
-        scanner.add("tree", "quality", "missing-tests", "tests")
+    if not any((repo / TEST_DIR).rglob(TEST_GLOB)):
+        scanner.add("tree", "quality", "missing-tests", TEST_DIR)
     if not manifest["quickstart"]:
         scanner.add("tree", "quality", "quickstart-not-declared", "release-check.json")
     if not any(item.get("role") == "tests" for item in manifest["checks"]):
         scanner.add("tree", "quality", "test-command-not-declared", "release-check.json")
     config = tomllib.loads((repo / "pyproject.toml").read_text()).get("tool", {}) if (repo / "pyproject.toml").exists() else {}
-    for name, role in (("ruff", "lint"), ("mypy", "types")):
+    for name, role in CONFIGURED_CHECKS:
         if name in config and not any(item.get("role") == role for item in manifest["checks"]):
             scanner.add("tree", "quality", "configured-check-not-declared", "pyproject.toml", value=role)
 
 
-def submodule_paths(repo: Path) -> set[str]:
-    return {os.fsdecode(entry.split(b"\t", 1)[1])
-            for entry in git(repo, "ls-files", "--stage", "-z").split(b"\0")
-            if entry.startswith(b"160000 ")}
-
-
-def export_destination_error(*paths: Path) -> AuditError:
-    existing = [str(path) for path in paths if path.exists() or path.is_symlink()]
-    return AuditError("export-destination-exists", "In the way: " + ", ".join(json.dumps(path).replace("\\\\", "\\") for path in existing)
-                      + ". Keep these folders and rerun the same command with --export NEW_DIR, where NEW_DIR and NEW_DIR.BLOCKED do not exist.")
-
-
 def copy_tree(repo: Path, target: Path, manifest: dict, scanner: Scanner):
-    if target.exists() or target.is_symlink():
-        raise export_destination_error(target)
+    if target.exists():
+        raise AuditError("export-destination-exists")
     if target == repo or repo in target.parents:
         raise AuditError("export-inside-source")
     if target in repo.parents:
         raise AuditError("export-parent-of-source")
     target.mkdir(mode=0o700, parents=True)
-    if git(repo, "rev-parse", "--is-shallow-repository").strip() == b"true":
-        scanner.add("export", "coverage", "shallow-history", "@git")
     excluded = [*DEFAULT_EXCLUDES, *manifest["exclude"]]
     tracked = {p.decode("utf-8", "surrogateescape") for p in git(repo, "ls-files", "-z").split(b"\0") if p}
-    submodules = submodule_paths(repo)
-    for rel in sorted(submodules):
-        scanner.add("export", "coverage", "submodule", rel)
-    copied = {}
-    left = set(untracked_files(repo, tracked))
     for root, dirs, files in os.walk(repo, followlinks=False):
         relative = Path(root).relative_to(repo)
-        dirs[:] = [d for d in dirs if d != ".git" and (relative / d).as_posix() not in submodules and not match_path((relative / d).as_posix(), excluded) and (d not in GENERATED or any(p.startswith((relative / d).as_posix() + "/") for p in tracked))]
+        dirs[:] = [d for d in dirs if d != ".git" and not match_path((relative / d).as_posix(), excluded) and (d not in GENERATED or any(p.startswith((relative / d).as_posix() + "/") for p in tracked))]
         for name in files:
             source = Path(root) / name
             rel = source.relative_to(repo).as_posix()
-            if name == ".git" or rel in submodules or match_path(rel, excluded) or credential_file(rel):
-                continue
-            if rel not in tracked:
-                left.add(rel)
+            if name == ".git" or match_path(rel, excluded):
                 continue
             if source.is_symlink() or not source.is_file():
                 scanner.add("export", "coverage", "unsupported-file", rel)
                 continue
             dest = target / rel
             dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            raw = source.read_bytes()
-            copied[rel] = hashlib.sha256(raw).hexdigest()
-            dest.write_bytes(raw)
+            shutil.copyfile(source, dest)
             dest.chmod(0o700 if source.stat().st_mode & 0o111 else 0o600)
         for name in dirs:
             if (Path(root) / name).is_symlink():
-                rel = (relative / name).as_posix()
-                if rel not in tracked:
-                    left.add(rel)
-                    continue
-                scanner.add("export", "coverage", "unsupported-file", rel)
-    git(target, "init", "-q", "--template=", "-b", "main")
-    (target / ".git/hooks").mkdir(mode=0o700)
-    (target / ".git/info").mkdir(mode=0o700)
-    (target / ".git/info/exclude").write_bytes(b"")
-    (target / ".git/description").write_bytes(b"Clean source export\n")
-    (target / ".git/config").write_bytes(EXPORT_CONFIG)
+                scanner.add("export", "coverage", "unsupported-file", (relative / name).as_posix())
+    git(target, "init", "-q", "-b", "main")
     # Explicit paths only; no remote, hooks, original identity or original history.
     paths = [str(p.relative_to(target)) for p in target.rglob("*") if p.is_file() and ".git" not in p.relative_to(target).parts]
     for start in range(0, len(paths), 100):
         git(target, "--literal-pathspecs", "add", "-f", "--", *paths[start:start + 100])
     git(target, "-c", "user.name=Release Export", "-c", "user.email=release-export", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", "Clean source export")
-    (target / ".git/COMMIT_EDITMSG").unlink()
-    for rel, expected in copied.items():
-        dest = target / rel
-        try:
-            matches = not dest.is_symlink() and hashlib.sha256(dest.read_bytes()).hexdigest() == expected
-        except OSError:
-            matches = False
-        if not matches:
-            scanner.add("export", "coverage", "export-content-mismatch", rel)
-    return {"files": copied, "not_exported": sorted(left)}
-
-
-def blocked_artifact(target: Path) -> bool:
-    return target.is_dir() and not (target / ".git").exists() and not (target / ".git").is_symlink() and (target / BLOCKED_README).is_file()
-
-
-def quarantine_export(target: Path):
-    """Remove only this run's generated Git metadata, including secret blobs."""
-    metadata = target / ".git"
-    record = metadata / AUDIT_RECORD
-    if record.is_file():
-        (target / AUDIT_RECORD).write_bytes(record.read_bytes())
-        (target / AUDIT_RECORD).chmod(0o600)
-    warning = target / BLOCKED_README
-    warning.write_text(BLOCKED_EXPORT_WARNING + "\n\nThis folder is NOT a release. Fix the source and create a new verified export.\n", encoding="utf-8")
-    warning.chmod(0o600)
-    if metadata.is_dir() and not metadata.is_symlink():
-        def remove_readonly(function, path, _error):
-            os.chmod(path, 0o700)
-            function(path)
-        shutil.rmtree(metadata, onerror=remove_readonly)
-
-
-def export_digest(target: Path) -> str:
-    try:
-        if blocked_artifact(target):
-            content = hashlib.sha256(b"release-check blocked artifact v1\0")
-            for file in sorted(target.rglob("*"), key=lambda p: p.relative_to(target).as_posix()):
-                if file.is_symlink() or not (file.is_dir() or file.is_file()):
-                    raise AuditError("export-not-clean")
-                content.update(file.relative_to(target).as_posix().encode("utf-8", "surrogateescape") + b"\0")
-                content.update(str(file.stat().st_mode & 0o111).encode() + b"\0" + str(file.stat().st_mtime_ns).encode() + b"\0")
-                content.update((b"directory" if file.is_dir() else file.read_bytes()) + b"\0")
-            return content.hexdigest()
-        metadata = target / ".git"
-        if (metadata.is_symlink() or not metadata.is_dir()
-                or (metadata / "config").is_symlink()
-                or (metadata / "config").read_bytes() != EXPORT_CONFIG
-                or (metadata / "HEAD").read_bytes() != b"ref: refs/heads/main\n"):
-            raise AuditError("export-not-clean")
-        # Exports have no template hooks and only loose, reachable objects. Check
-        # the inventory before running Git: alternates/grafts/attributes cannot
-        # influence the check or cause reads outside the export.
-        fixed = {"HEAD", "config", "description", "index", "info/exclude", "refs/heads/main", "logs/HEAD", "logs/refs/heads/main"}
-        if (metadata / AUDIT_RECORD).exists():
-            fixed.add(AUDIT_RECORD)
-        entries = {p.relative_to(metadata).as_posix(): p for p in metadata.rglob("*")}
-        for rel, file in entries.items():
-            if file.is_symlink() or not (file.is_dir() or file.is_file()):
-                raise AuditError("export-not-clean")
-            if file.is_file() and rel not in fixed and not re.fullmatch(r"objects/[a-f0-9]{2}/[a-f0-9]{38}", rel):
-                raise AuditError("export-not-clean")
-        objects = {"objects/" + oid[:2] + "/" + oid[2:] for oid in git(target, "rev-list", "--objects", "--no-object-names", "--all").decode().splitlines()}
-        allowed_files = fixed | objects
-        allowed_dirs = {"hooks", "info", "objects", "objects/info", "objects/pack", "refs", "refs/heads", "refs/tags", "logs", "logs/refs", "logs/refs/heads"} | {Path(p).parent.as_posix() for p in objects}
-        if {r for r, p in entries.items() if p.is_file()} != allowed_files or {r for r, p in entries.items() if p.is_dir()} != allowed_dirs:
-            raise AuditError("export-not-clean")
-        if git(target, "fsck", "--full", "--strict", "--unreachable", "--no-reflogs").strip():
-            raise AuditError("export-not-clean")
-        oid = git(target, "rev-parse", "HEAD").strip()
-        committer = next(line for line in git(target, "cat-file", "commit", oid.decode()).splitlines() if line.startswith(b"committer "))
-        expected_log = b"0" * 40 + b" " + oid + b" " + committer.removeprefix(b"committer ") + b"\tcommit (initial): Clean source export\n"
-        if ((metadata / "description").read_bytes() != b"Clean source export\n"
-                or (metadata / "info/exclude").read_bytes()
-                or any((metadata / name).read_bytes() != expected_log for name in ("logs/HEAD", "logs/refs/heads/main"))):
-            raise AuditError("export-not-clean")
-        if (git(target, "rev-list", "--count", "--all").strip() != b"1"
-                or git(target, "rev-list", "--count", "HEAD").strip() != b"1"
-                or git(target, "for-each-ref", "--format=%(refname)").splitlines() != [b"refs/heads/main"]
-                or git(target, "remote").strip()
-                or git(target, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
-                or git(target, "status", "--porcelain", "--untracked-files=all")):
-            raise AuditError("export-not-clean")
-        content = hashlib.sha256()
-        tracked = sorted(p for p in git(target, "ls-files", "-z").split(b"\0") if p)
-        expected_dirs = {parent.as_posix() for raw in tracked for parent in Path(os.fsdecode(raw)).parents if str(parent) != "."}
-        actual_dirs = {p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_dir() and ".git" not in p.relative_to(target).parts}
-        if actual_dirs != expected_dirs:
-            raise AuditError("export-not-clean")
-        for raw in tracked:
-            file = target / os.fsdecode(raw)
-            if file.is_symlink() or not file.is_file():
-                raise AuditError("export-not-clean")
-            content.update(raw + b"\0" + str(file.stat().st_mode & 0o111).encode() + b"\0" + str(file.stat().st_mtime_ns).encode() + b"\0")
-            content.update(file.read_bytes() + b"\0")
-        for rel in sorted(entries):
-            file = entries[rel]
-            content.update(rel.encode() + b"\0" + (b"directory" if file.is_dir() else file.read_bytes()) + b"\0")
-        return hashlib.sha256(git(target, "rev-parse", "HEAD").strip() + b"\0" + content.hexdigest().encode()).hexdigest()
-    except (AuditError, OSError):
-        raise AuditError("export-not-clean") from None
 
 
 def safe_environment(home: Path, bin_dir: Path) -> dict:
     # Credentials, Git config, application caches and provider opt-ins do not inherit.
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    paths = [str(bin_dir)]
-    git_executable = shutil.which("git")
-    if git_executable:
-        paths.append(str(Path(git_executable).parent))
-    environment = {"HOME": str(home), "TMPDIR": str(home), "TEMP": str(home), "TMP": str(home), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
-    if sys.platform == "win32":
-        system_root = os.environ.get("SystemRoot", os.environ.get("WINDIR", ""))
-        if system_root:
-            environment.update(SystemRoot=system_root, WINDIR=system_root)
-            paths.extend([str(Path(system_root) / "System32"), system_root])
-        environment.update(USERPROFILE=str(home), APPDATA=str(home / "AppData/Roaming"), LOCALAPPDATA=str(home / "AppData/Local"), PATHEXT=".COM;.EXE;.BAT;.CMD")
-    else:
-        paths.extend(["/usr/local/bin", "/usr/bin", "/bin"])
-    environment["PATH"] = os.pathsep.join(dict.fromkeys(paths))
-    return environment
+    (home / "tmp").mkdir(mode=0o700, exist_ok=True)
+    return {"TMPDIR": str(home / "tmp"), "HOME": str(home), "PATH": str(bin_dir) + os.pathsep + "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "PYTHONNOUSERSITE": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "XDG_CACHE_HOME": str(home / "cache"), "XDG_CONFIG_HOME": str(home / "config")}
 
 
 def command(argv: list[str], cwd: Path, env: dict, timeout: int) -> tuple[int, bytes]:
     # A timeout kills the process group, including any subprocess the test spawned.
     with tempfile.TemporaryFile() as output:
-        # Windows otherwise searches the parent's PATH when creating a process.
-        executable = shutil.which(argv[0], path=env.get("PATH", ""))
-        if executable is None:
-            return 127, MISSING_EXECUTABLE_OUTPUT
-        process = subprocess.Popen([executable, *argv[1:]], cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        process = subprocess.Popen(argv, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            if sys.platform == "win32":
-                taskkill = Path(env["SystemRoot"]) / "System32/taskkill.exe"
-                subprocess.run([str(taskkill), "/PID", str(process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if process.poll() is None:
-                    process.kill()
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal.SIGKILL)
             process.wait()
             code = 124
         output.seek(0)
         return code, output.read(8 * 1024 * 1024)
 
 
-METADATA_SCRIPT = '''import importlib.metadata as m, json
+# Bounds apply before reading/serializing installed files, and again at ingestion.
+MAX_LICENSE_BYTES = 256 * 1024
+MAX_METADATA_BYTES = 4 * 1024 * 1024
+MAX_PACKAGES = 2048
+MAX_LICENSE_FILES = 256
+
+
+def decode_licence(raw: bytes) -> str:
+    """Choose byte order from BOMs or NUL lanes, never from printability."""
+    encoding = "utf-8"
+    for bom, encoding in ((b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"),
+                          (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16"),
+                          (b"\xef\xbb\xbf", "utf-8-sig")):
+        if raw.startswith(bom):
+            break
+    else:
+        encoding = "utf-8"
+        if b"\0" in raw:
+            # Licence prose is predominantly ASCII. Require a clear data lane
+            # and predominantly zero high bytes; ambiguous patterns fail closed.
+            def data_lane(width, offset):
+                lanes = [raw[i::width] for i in range(width)]
+                return all(lane and (lane.count(0) / len(lane) < .2 if i == offset
+                                     else lane.count(0) / len(lane) > .8)
+                           for i, lane in enumerate(lanes))
+            encodings = [name for width in (4, 2) for offset, name in
+                         ((0, f"utf-{width * 8}-le"), (width - 1, f"utf-{width * 8}-be"))
+                         if data_lane(width, offset)]
+            if len(encodings) != 1:
+                return "\ufffd" + raw.decode("utf-8", errors="replace")
+            encoding = encodings[0]
+    try:
+        text = raw.decode(encoding)
+        if not any(not c.isprintable() and c not in "\n\r\t\f" and unicodedata.category(c) != 'Cf' for c in text):
+            return text
+    except UnicodeError:
+        pass
+    # Preserve readable restrictions, but mark every uncertain/corrupt decode.
+    # readable_licence rejects this marker, so digest evidence cannot waive it.
+    return "\ufffd" + raw.decode(encoding, errors="replace")
+
+
+def licence_candidate(path: str, declared: bool = False) -> bool:
+    parts = Path(path).parts
+    name = Path(path).name
+    return (declared or bool(re.fullmatch(DEPENDENCY_LICENSE_FILE, name, re.I))
+            or any(p.casefold() in {"licenses", "licences"} for p in parts[:-1])
+            or bool(re.fullmatch(r"(?:MIT|MIT-0|BSD(?:-[234]-Clause)?|ISC|Apache-2\.0|Zlib|Unlicense|CC0-1\.0|BSL-1\.0|PSF-2\.0|[AL]?GPL(?:-[0-9.]+(?:-only|-or-later)?)?|MPL(?:-[0-9.]+)?|EPL(?:-[0-9.]+)?)(?:\.(?:txt|md|rst))?", name, re.I)))
+
+
+METADATA_SCRIPT = ('import importlib.metadata as m, json, re, hashlib, csv, unicodedata\nfrom pathlib import Path\n'
+                   + 'MAX_LICENSE_BYTES=' + str(MAX_LICENSE_BYTES) + '\n'
+                   + 'MAX_METADATA_BYTES=' + str(MAX_METADATA_BYTES) + '\n'
+                   + 'MAX_PACKAGES=' + str(MAX_PACKAGES) + '\n'
+                   + 'MAX_LICENSE_FILES=' + str(MAX_LICENSE_FILES) + '\n'
+                   + inspect.getsource(decode_licence) + inspect.getsource(licence_candidate).replace('DEPENDENCY_LICENSE_FILE', repr(DEPENDENCY_LICENSE_FILE)) + '''
+def declared(d,p):
+ return any(str(p)==f or str(p).endswith('/'+f) for f in d.metadata.get_all('License-File',[]))
 out=[]
+total=0
 for d in m.distributions():
- if d.metadata.get('Name','').lower() in {'pip','setuptools'}: continue
- out.append({'name':d.metadata.get('Name'), 'version':d.version,
+ if (d.metadata.get('Name') or '').lower() in {'pip','setuptools'}: continue
+ files=[]
+ file_bytes=0
+ limited=False
+ # Read RECORD directly: recent importlib versions silently drop missing files.
+ record_text=d.read_text('RECORD')
+ if record_text is not None:
+  rows=list(csv.reader(record_text.splitlines()))
+  records=[Path(row[0]) for row in rows if row and row[0]]
+  invalid=not records or any(len(row)!=3 or not row[0] for row in rows)
+ else:
+  records=d.files
+  invalid=not records
+ metadata=d.metadata
+ if metadata.defects or any(len(metadata.get_all(key,[]))!=1 for key in ('Name','Version')): invalid=True
+ # A licence present inside dist-info but omitted from RECORD is also a gap.
+ metadata_path=getattr(d,'_path',None)
+ if isinstance(metadata_path,Path) and metadata_path.is_dir():
+  recorded={d.locate_file(p) for p in (records or [])}
+  if any(licence_candidate(str(p.relative_to(metadata_path))) and p not in recorded for p in metadata_path.rglob('*') if p.is_file() or p.is_symlink()): invalid=True
+ declarations=d.metadata.get_all('License-File',[])
+ if any(not f.strip() or not any(str(p)==f or str(p).endswith('/'+f) for p in (records or [])) for f in declarations): invalid=True
+ for p in (records or []):
+  if not licence_candidate(str(p),declared(d,p)): continue
+  path=d.locate_file(p)
+  if not path.is_file() or path.is_symlink():
+   invalid=True
+   continue
+  if len(files)>=MAX_LICENSE_FILES or path.stat().st_size>MAX_LICENSE_BYTES:
+   limited=True
+   break
+  with path.open('rb') as handle: raw=handle.read(MAX_LICENSE_BYTES+1)
+  if len(raw)>MAX_LICENSE_BYTES:
+   limited=True
+   break
+  entry={'path':str(p),'hash':hashlib.sha256(raw).hexdigest(),'text':decode_licence(raw),'declared':declared(d,p)}
+  file_bytes+=len(json.dumps(entry).encode())
+  if total+file_bytes>MAX_METADATA_BYTES:
+   limited=True
+   break
+  files.append(entry)
+ item={'name':d.metadata.get('Name'), 'version':d.version,
  'expression':d.metadata.get('License-Expression'), 'license':d.metadata.get('License'),
- 'classifiers':d.metadata.get_all('Classifier',[]),
- 'license_files':[{'path':str(p),'hash':__import__('hashlib').sha256(d.locate_file(p).read_bytes()).hexdigest()}
- for p in (d.files or []) if any(x in str(p).upper() for x in ('LICENSE','COPYING','NOTICE')) and d.locate_file(p).is_file()]})
-print(json.dumps(out))'''
+ 'expressions':d.metadata.get_all('License-Expression',[]), 'licenses':d.metadata.get_all('License',[]),
+ 'classifiers':d.metadata.get_all('Classifier',[]), 'license_files':files}
+ if limited: item['metadata_limit']=True
+ if invalid: item['metadata_invalid']=True
+ total+=len(json.dumps(item).encode())
+ if len(out)>=MAX_PACKAGES or total>MAX_METADATA_BYTES:
+  out=[{'metadata_limit':True}]
+  break
+ out.append(item)
+print(json.dumps(out))''')
 
-COMPATIBLE = {"MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "PSF-2.0", "0BSD", "Unlicense", "CC0-1.0", "Python-2.0", "MPL-2.0", "MIT-CMU", "CNRI-Python", "Zlib", "BSL-1.0", "Apache-2.0 WITH LLVM-exception"}
-CLASSIFIERS = {"MIT License": "MIT", "Apache Software License": "Apache-2.0", "BSD License": "BSD", "ISC License (ISCL)": "ISC", "Python Software Foundation License": "PSF-2.0", "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0"}
+# Widely used permissive identifiers; weak copyleft follows the recorded policy.
+COMPATIBLE = {"MIT", "MIT-0", "Apache-2.0", "BSD", "BSD-2-Clause", "BSD-3-Clause", "BSD-4-Clause", "ISC", "Zlib", "PSF-2.0", "0BSD", "Unlicense", "CC0-1.0", "Python-2.0", "BSL-1.0", "NCSA", "HPND", "X11", "WTFPL"}
+SPDX_OPERATORS = r"(?<![\w.-])(?:AND|OR)(?![\w.-])"
+# Full matches only. Trove prefixes are validated separately, never discarded.
+CLASSIFIERS = {
+    "MIT License": "MIT", "MIT No Attribution License (MIT-0)": "MIT-0",
+    "Apache Software License": "Apache-2.0", "BSD License": "BSD",
+    "ISC License (ISCL)": "ISC", "Python Software Foundation License": "PSF-2.0",
+    "zlib/libpng License": "Zlib", "The Unlicense (Unlicense)": "Unlicense",
+    "Boost Software License 1.0 (BSL-1.0)": "BSL-1.0",
+    "CC0 1.0 Universal (CC0 1.0) Public Domain Dedication": "CC0-1.0",
+    "Mozilla Public License 2.0 (MPL 2.0)": "MPL-2.0",
+    "Eclipse Public License 2.0 (EPL-2.0)": "EPL-2.0",
+    "GNU Lesser General Public License v2 (LGPLv2)": "LGPL-2.1",
+    "GNU Lesser General Public License v2 or later (LGPLv2+)": "LGPL-2.1-or-later",
+    "GNU Lesser General Public License v3 (LGPLv3)": "LGPL-3.0",
+    "GNU Lesser General Public License v3 or later (LGPLv3+)": "LGPL-3.0-or-later",
+    "GNU Library or Lesser General Public License (LGPL)": "LGPL",
+}
+
+# Normalise visual separators, not arbitrary suffixes. Unknown full labels block.
+LOOKALIKES = str.maketrans(dict(zip(
+    "АВЕІЈКМНОРСТХаеіјорсхуΑΒΕΖΗΙΚΜΝΟΡΤΥΧαεικνορτυх",
+    "ABEIJKMHOPCTXaeijopcyyABEZHIKMNOPTYXaeikvoptyx")))
 
 
-def compatible_license(label: str | None) -> bool:
-    if not isinstance(label, str):
+def licence_characters(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).translate(LOOKALIKES)
+    return "".join(c for c in text if unicodedata.category(c) != "Cf")
+
+
+def label_key(text: str) -> str:
+    # Keep word boundaries, parentheses and expression operators distinct.
+    text = licence_characters(text).casefold()
+    text = re.sub(r"(?<=[a-z])(?:[.\-]\s*)+(?=[a-z])", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+LABELS = {label_key(x): "accepted" for x in COMPATIBLE}
+for base in ("LGPL-2.0", "LGPL-2.1", "LGPL-3.0", "MPL-1.1", "MPL-2.0", "EPL-1.0", "EPL-2.0"):
+    for suffix in ("", "-only", "-or-later", "+"):
+        LABELS[label_key(base + suffix)] = "accepted"
+for name in CLASSIFIERS:
+    LABELS[label_key(name)] = "accepted"
+for name in (
+    "MIT License", "The MIT License", "The MIT License (MIT)", "MIT Software License",
+    "Expat", "Expat (MIT/X11)", "MIT/X11", "Apache Software License",
+    "Apache License, Version 2.0", "Apache License 2.0", "Apache 2.0",
+    "BSD License", "BSD 2-Clause", "BSD 2-Clause License", "BSD 3-Clause",
+    "BSD 3-Clause License", "BSD 4-Clause License", "New BSD License", "Modified BSD License",
+    "Public Domain", "CC0 1.0 Universal", "ISC License", "Zlib License", "Zlib/libpng License",
+    "LGPL", "LGPL v3", "LGPLv2", "LGPLv2.1", "LGPLv3", "LGPLv3+", "LGPLv2+",
+    "GNU Library General Public License", "GNU Lesser General Public License",
+    "MPL", "EPL", "Eclipse Public License 2.0", "Eclipse Public License 1.0",
+    "GNU Lesser General Public License v3", "GNU Lesser General Public License v2.1",
+    "GNU Lesser General Public License v2 or later (LGPLv2+)",
+):
+    LABELS[label_key(name)] = "accepted"
+for base in ("GPL", "AGPL", "GPL-1.0", "GPL-2.0", "GPL-3.0", "AGPL-3.0"):
+    for suffix in ("", "-only", "-or-later", "+"):
+        LABELS[label_key(base + suffix)] = "strong"
+for name in ("GPLv2", "GPLv3", "GPLv2+", "GPLv3+", "GPL 3", "GPL3+", "GPL3", "GPL_v3",
+             "AGPLv3", "GNU GPL v3", "GNU General Public License", "General Public Licence",
+             "GNU Affero General Public License", "GNU Affero General Public License v3",
+             "GNU General Public License v2 (GPLv2)", "GNU General Public License v3 (GPLv3)",
+             "GNU General Public License v2 or later (GPLv2+)", "GNU General Public License v3 or later (GPLv3+)",
+             "GNU Affero General Public License v3 or later (AGPLv3+)", "GNU Affero General Public License v3 (AGPLv3)"):
+    LABELS[label_key(name)] = "strong"
+for name in ("Proprietary", "Other/Proprietary License", "Commercial", "Free For Home Use",
+             "Elastic License 2.0", "BUSL-1.1", "CC-BY-NC-SA-4.0", "CC-BY-NC", "Commons Clause",
+             "All Rights Reserved", "Internal use only", "For internal use only",
+             "Polyform Noncommercial", "SSPL", "SSPL-1.0", "Server Side Public License"):
+    LABELS[label_key(name)] = "proprietary"
+
+# These mean no assertion, never acceptance; another source must establish it.
+HARMLESS_LICENSE_PLACEHOLDERS = {"unknown", "none", "noassertion", "dual license"}
+
+
+def strong_licence(text: str) -> bool:
+    # Only used on evidence that has FAILED complete-text recognition. Thus a
+    # recognised LGPL/MPL text quoting GPL is never confused with a GPL grant.
+    prose = label_key(text)
+    compact = re.sub(r"[^a-z0-9]", "", licence_characters(text).casefold())
+    return any(part in compact for part in ("gnugeneralpubliclicense", "gnugeneralpubliclicence",
+        "gnuafferogeneralpubliclicense", "gnuafferogeneralpubliclicence", "gnupubliclicense", "gnupubliclicence")) or bool(
+        re.search(r"(?<![a-z])a?g[.\-\s]*p[.\-\s]*l(?:[_ -]?v?[_ -]?\d|\b)",
+                  licence_characters(text).casefold())) or bool(
+        re.search(r'(?<!lesser )(?<!library )\bgeneral public licen[cs]e\b', prose))
+
+
+def proprietary_licence(text: str) -> bool:
+    key = label_key(text)
+    prose = re.sub(r"\s+", " ", licence_characters(text).casefold())
+    return (any(re.search(r'(?<!\w)' + re.escape(label) + r'(?!\w)', key)
+                for label, state in LABELS.items() if state == 'proprietary')
+            or bool(re.search(r"\b(?:proprietary|non[- ]?commercial|no redistribution|"
+                              r"redistribution (?:of this software )?is prohibited|"
+                              r"internal use only|server side public licen[cs]e|sspl)\b", prose)))
+
+
+def licence_atom(label: str) -> str:
+    return LABELS.get(label_key(label), "unknown")
+
+
+def licence_restriction(text: str) -> str:
+    """An unsuccessful parse must retain stronger assertions in its input."""
+    return 'strong' if strong_licence(text) else 'proprietary' if proprietary_licence(text) else 'unknown'
+
+
+def licence_classifier(label: str) -> str | None:
+    parts = [p.strip() for p in licence_characters(label).split("::")]
+    if not parts or parts[0].casefold() != "license":
+        return "unknown"
+    if [p.casefold() for p in parts] == ['license', 'osi approved']:
+        return None  # a neutral parent category, never an acceptance assertion
+    ending = " :: ".join(parts[1:])
+    prefix = "OSI Approved :: "
+    if ending.startswith(prefix):
+        state = licence_atom(ending[len(prefix):])
+    else:
+        state = licence_atom(ending)
+    # Accepted legacy two-part licence classifiers are still full table matches.
+    return licence_restriction(label) if state == 'unknown' else state
+
+
+LICENSE_EXCEPTIONS = {"classpath-exception-2.0", "llvm-exception"}
+
+
+def licence_evidence_file(path: str, declared: bool = False) -> bool:
+    return (not re.fullmatch(r"NOTICE.*", Path(path).name, re.I)
+            and Path(path).suffix.casefold() in {"", ".txt", ".md", ".rst", ".mit", ".bsd", ".apache", ".isc", ".gpl", ".agpl", ".lgpl", ".mpl", ".epl"}
+            and licence_candidate(path, declared))
+
+
+def licence_expression_limited(label: str) -> bool:
+    return len(label) > 8192 or label.count('(') > 64
+
+
+def licence_expression(label: str) -> str:
+    """Within a valid choice OR needs one branch; independent sources still win."""
+    if licence_expression_limited(label):
+        return licence_restriction(label)
+    atom = licence_atom(label)
+    operators = SPDX_OPERATORS + r"|(?<![\w.-])WITH(?![\w.-])"
+    if atom == "accepted" or atom != "unknown" and not re.search(operators, label, re.I):
+        return atom
+    tokens = [t.strip() for t in re.split(r"(\(|\)|" + SPDX_OPERATORS + ")", label, flags=re.I) if t.strip()]
+    position = 0
+
+    def parse_identifier(token):
+        state = licence_atom(token)
+        if state == "unknown" and not re.fullmatch(r"LicenseRef-[A-Za-z0-9.-]+", token, re.I):
+            raise ValueError
+        if state in {"strong", "proprietary"} and not re.fullmatch(r"(?:a?gpl)(?:[ _-]?v?[_ -]?\d+(?:\.\d+)*(?:-only|-or-later|\+)?)?|(?:gnu )?(?:affero )?general public licen[cs]e(?: (?:v|version )?[0-9.]+(?: or later)?)?(?: \((?:a?gpl)[0-9v.+-]*\))?", token, re.I):
+            raise ValueError
+        return state
+
+    def parse_atom():
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError
+        token = tokens[position]
+        position += 1
+        if token == "(":
+            state = parse_or()
+            if position >= len(tokens) or tokens[position] != ")":
+                raise ValueError
+            position += 1
+            return state
+        if token.upper() in {"AND", "OR", ")"}:
+            raise ValueError
+        parts = re.split(r"(?<![\w.-])WITH(?![\w.-])", token, flags=re.I)
+        if len(parts) == 2:
+            base = parse_identifier(parts[0].strip())
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", parts[1].strip()):
+                raise ValueError
+            if base != "unknown" and parts[1].strip().casefold() in LICENSE_EXCEPTIONS:
+                return base
+            return base if base in {"strong", "proprietary"} else "unknown"
+        if len(parts) != 1:
+            raise ValueError
+        return parse_identifier(token)
+
+    def parse_and():
+        nonlocal position
+        state = parse_atom()
+        while position < len(tokens) and tokens[position].upper() == "AND":
+            position += 1
+            other = parse_atom()
+            state = next((s for s in ("strong", "proprietary", "unknown") if s in (state, other)), "accepted")
+        return state
+
+    def parse_or():
+        nonlocal position
+        state = parse_and()
+        while position < len(tokens) and tokens[position].upper() == "OR":
+            position += 1
+            other = parse_and()
+            state = "accepted" if "accepted" in (state, other) else next((s for s in ("strong", "proprietary", "unknown") if s in (state, other)))
+        return state
+
+    try:
+        state = parse_or()
+        # Unknown references/exceptions can themselves contain stronger evidence.
+        return state if position == len(tokens) and state != 'unknown' else licence_restriction(label)
+    except (ValueError, RecursionError):
+        return licence_restriction(label)
+
+
+# Whole-text digests are fingerprints of canonical normative text, not a cache
+# learned from the package being audited. Short passages identify the candidate;
+# its full digest accounts for every remaining meaningful character.
+LICENSE_TEXTS = {
+    'MIT': (('permission is hereby granted free of charge', 'subject to the following conditions', 'the above copyright notice and this permission notice'), ['81a61d35f6891e560d80c95e831624d3270eb7ccf5f492522851169cb355ddab']),
+    'MIT-0': (('permission is hereby granted free of charge', 'to permit persons to whom the software is furnished to do so', 'authors or copyright holders be liable'), ['9dde5a381a6884c081965fac48c212c08192ff93173adbaa496985824107f58a']),
+    'BSD-2-Clause': (('redistribution and use in source and binary forms', 'redistributions of source code must retain', 'redistributions in binary form must reproduce'), ['1328f1513430d5690e86eb9a63ac9031702d4570f7d910e9be7c7046cb091c85', '73df6017d799dcaf80d531190070f97c3a5a100e92b0646fe6829d12293241bb']),
+    'BSD-3-Clause': (('redistribution and use in source and binary forms', 'neither the name', 'without specific prior written permission'), ['fad79cba3e77e83e69641bd7d3dd8ee15938439023e379b5bbcc829d32bb49d3']),
+    'ISC': (('permission to use copy modify andor distribute this software', 'for any purpose with or without fee', 'the author disclaims all warranties'), ['2ca2d1ff4c9cab1849313ddab628dd0788dbfa472a7dd51d27c021daa6aa3d2e', '513c8bf5ea4b9d31dc7c1d5e612891fa487b66584e78166eed33729a0e421aef']),
+    'Apache-2.0': (('grant of copyright license', 'grant of patent license', 'commercial damages or losses'), ['9385e77162734bf297f30f924cb02e25e9b96adc73405f38cf55279760020177', 'ebfb9839bd55fb97095d377ca4adb8514fee4dd44a98ccbe2a8b430b3fe605f5']),
+    'Zlib': (('the origin of this software must not be misrepresented', 'altered source versions must be plainly marked', 'this notice may not be removed or altered'), ['bea003f54e548bce073823f937798022b5d2bfe0c152d363e2b62c3b40d8ad73']),
+    'Unlicense': (('this is free and unencumbered software released into the public domain', 'relinquishment in perpetuity', 'detriment of our heirs and successors'), ['bb28cc84551e602fa595813d0910e669c92cf2465e9b1bdc916144ab8bc37666']),
+    'CC0-1.0': (('waiver', 'public license fallback', 'limitations and disclaimers'), ['a1c5451395262a9c57097cf8ed1be6259bce24f74691c20b350916c920658336']),
+    'MPL-2.0': (('each contributor hereby grants', 'incompatible with secondary licenses', 'if you initiate litigation against any entity'), ['b203b68ce18fc8813145291e137d23b974d9d04de13b0366be0bb4431a2d1cb1']),
+    'LGPL-2.1': (('this license the lesser general public license', 'you must cause the whole of the work to be licensed', 'as a consequence of a court judgment'), ['4dbd050ce7b4900cd3dcd7afbd0ac8785c7f54aba832e515e3002c23d3d0a965']),
+    'LGPL-3.0': (('this version of the gnu lesser general public license incorporates', 'recombine or relink the application', 'use a suitable shared library mechanism'), ['be266b3e6b95a63311f981209450506637ec6eb6c4859e4c761c158ded39a699']),
+    'GPL-2.0': (('gnu general public license', 'you must cause any work that you distribute or publish', 'no warranty'), ['d10b192c1f24c2580f4f91ac32263c90fea0c6a00c0dbc5305fbd0ec3d7522b0']),
+    'GPL-3.0': (('gnu general public license', 'protecting users legal rights from anticircumvention law', 'no surrender of others freedom'), ['d0ae9f8a0066fc711eece17ebee94b45e4b5d0010f1613115eac1b83b161051f']),
+    'BSL-1.0': (('to use reproduce display distribute execute and transmit', 'machineexecutable object code generated by', 'title and noninfringement'), ['3e92e670923680267ede2c7222e5cd6f7c2e495d94278af51c90425717d26551']),
+    'PSF-2.0': (('python software foundation', 'worldwide license to reproduce analyze test', 'relationship of agency partnership or joint venture'), ['2366c0b8707a123d4de87ccc1a0c859aabcd37d4f5bab83eff1364a23f202ffe']),
+}
+
+SPDX_LICENSES = {
+    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0",
+    *(f"{family}-{version}" for family, versions in (
+        ("GPL", ("1.0", "2.0", "3.0")), ("AGPL", ("3.0",)),
+        ("LGPL", ("2.0", "2.1", "3.0")),
+    ) for version in versions),
+    *(f"{family}-{version}-{suffix}" for family, versions in (
+        ("GPL", ("1.0", "2.0", "3.0")), ("AGPL", ("3.0",)),
+        ("LGPL", ("2.0", "2.1", "3.0")),
+    ) for version in versions for suffix in ("only", "or-later")),
+}
+
+
+def project_license_identifier(text: str) -> str | None:
+    """Identify only a known SPDX declaration or an intact canonical licence text."""
+    if len(text.encode("utf-8")) > MAX_LICENSE_BYTES or not readable_licence(text):
+        return None
+    declarations = re.findall(r"^[ \t]*SPDX-License-Identifier:[ \t]*([^\r\n]+)$", text, re.I | re.M)
+    body = re.sub(r"^[ \t]*SPDX-License-Identifier:[^\r\n]*", "", text, flags=re.I | re.M)
+    if declarations:
+        if len(declarations) != 1 or body.strip():
+            return None
+        identifier = declarations[0].strip()
+        return identifier if identifier in SPDX_LICENSES else None
+    key = hashlib.sha256(licence_text_key(text, root_mit=True).encode()).hexdigest()
+    for identifier, (_, digests) in LICENSE_TEXTS.items():
+        if identifier in SPDX_LICENSES and key in digests:
+            return identifier
+    return None
+
+
+def licence_text_key(text: str, *, root_mit: bool = False) -> str:
+    text = licence_characters(text)
+    # Only ordinary standalone copyright headers are variable. A prose suffix,
+    # extra sentence, or restriction is retained and invalidates the full digest.
+    holder_word = r"(?:[A-Z][\w'-]*(?:\.)?|and|of|the|contributors|individual)"
+    copyright_line = (r"Copyright\s*(?:\([cC]\)|©)?\s*(?:[0-9]{4}(?:[ ,\-–]+[0-9]{4})*[, ]*)?"
+                      + holder_word + r"(?:[ ]+" + holder_word + r"){0,15}\.?[ \t]*")
+    lines = text.splitlines()
+    prefix = True
+    saw_copyright = False
+    kept = []
+    for line in lines:
+        stripped = line.strip()
+        heading = (bool(re.fullmatch(r"(?:The )?MIT(?: (?:Software )?License)?(?: \(MIT\))?", stripped, re.I))
+                   if root_mit else licence_atom(stripped) == "accepted")
+        if prefix and (not stripped or re.fullmatch(r"[-=_]+", stripped) or heading):
+            continue
+        if prefix and re.fullmatch(copyright_line, stripped) and licence_restriction(stripped) == 'unknown':
+            saw_copyright = True
+            continue
+        if prefix and saw_copyright and stripped.casefold() == "all rights reserved.":
+            continue
+        if stripped:
+            prefix = False
+        kept.append(line)
+    # Case, punctuation, quotes, whitespace and hyphenation are irrelevant to
+    # identification. Letters/digits and their order remain fully accounted for.
+    return "".join(c for c in "\n".join(kept).casefold() if c.isalnum())
+
+
+def intact_licence_text(text: str) -> bool:
+    return "\ufffd" not in text and not any(
+        not c.isprintable() and c not in "\n\r\t\f" and unicodedata.category(c) != "Cf" for c in text)
+
+
+def readable_licence(text: str) -> bool:
+    return bool(text.strip()) and intact_licence_text(text)
+
+
+def licence_file_state(text: str) -> str:
+    if len(text.encode('utf-8')) > MAX_LICENSE_BYTES:
+        return "unknown"
+    if not readable_licence(text):
+        return licence_restriction(text)
+    declarations = re.findall(r"^[ \t]*SPDX-License-Identifier:[ \t]*([^\r\n]+)$", text, re.I | re.M)
+    body = re.sub(r"^[ \t]*SPDX-License-Identifier:[^\r\n]*", "", text, flags=re.I | re.M)
+    declaration_states = [licence_expression(d) for d in declarations]
+    key = licence_text_key(body)
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    text_state = "unknown"
+    for identifier, (passages, digests) in LICENSE_TEXTS.items():
+        if digest in digests and all(licence_text_key(p) in key for p in passages):
+            text_state = "strong" if identifier.startswith(("GPL-", "AGPL-")) else "accepted"
+            break
+    if not body.strip() and declarations:
+        text_state = "accepted"  # a complete SPDX-only declaration, no stray body
+    if text_state == "unknown" and strong_licence(body):
+        text_state = "strong"
+    if text_state == "unknown" and proprietary_licence(body):
+        text_state = "proprietary"
+    states = [text_state, *declaration_states]
+    return next((state for state in ("strong", "proprietary", "unknown") if state in states), "accepted")
+
+
+def valid_dependency_metadata(package) -> bool:
+    if not isinstance(package, dict):
         return False
-    parts = re.split(r"\s+(?:AND|OR)\s+", label.strip("()"))
-    return bool(label) and all(p.strip("() ") in COMPATIBLE for p in parts)
+    if any(not isinstance(package.get(key), str) or not package[key].strip() for key in ("name", "version")):
+        return False
+    if any(package.get(key) is not None and not isinstance(package[key], str) for key in ("expression", "license")):
+        return False
+    if any(not isinstance(package.get(key, []), list) or any(not isinstance(value, str) for value in package.get(key, []))
+           for key in ("expressions", "licenses", "classifiers")):
+        return False
+    values = [package['name'], package['version'], package.get('expression') or '', package.get('license') or '',
+              *package.get('expressions', []), *package.get('licenses', []), *package.get('classifiers', [])]
+    if any(not intact_licence_text(value) for value in values):
+        return False
+    files = package.get("license_files")
+    return isinstance(files, list) and all(
+        isinstance(f, dict) and isinstance(f.get("path"), str) and bool(f["path"])
+        and isinstance(f.get("hash"), str) and bool(re.fullmatch(r"[a-f0-9]{64}", f["hash"]))
+        and isinstance(f.get("text"), str) and isinstance(f.get("declared", False), bool)
+        for f in files)
 
 
 def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -> dict:
-    packages = json.loads(raw)
-    count = 0
-    dispositions = []
+    def limit():
+        scanner.add("verification", "coverage", "dependency-metadata-limit", "@dependencies")
+    if len(raw) > MAX_METADATA_BYTES:
+        limit()
+        return {"packages": 0, "blocked": 1, "accepted_on_license_file": []}
+    def invalid():
+        scanner.add("verification", "coverage", "dependency-metadata-invalid", "@dependencies")
+        return {"packages": 0, "blocked": 1, "accepted_on_license_file": []}
+    try:
+        packages = json.loads(raw, object_pairs_hook=unique_json_object)
+    except (ValueError, RecursionError):
+        return invalid()
+    if not isinstance(packages, list):
+        return invalid()
+    if len(packages) > MAX_PACKAGES:
+        limit()
+        return {"packages": len(packages), "blocked": 1, "accepted_on_license_file": []}
+    project_names = set()
+    for filename, parse in (("pyproject.toml", tomllib.loads), ("package.json", json.loads)):
+        path = repo / filename
+        if path.is_file():
+            metadata = parse(path.read_text())
+            project = metadata.get("project", {}) if filename == "pyproject.toml" else metadata
+            name = project.get("name")
+            if isinstance(name, str) and name.strip():
+                project_names.add(re.sub(r"[-_.]+", "-", name).lower())
+    count, accepted_files = 0, []
     for package in packages:
-        name = package["name"] or "unknown"
-        label = package["expression"]
-        if not label:
-            text = (package["license"] or "").strip()
-            if compatible_license(text):
-                label = text
-            elif "MIT License" in text and "Permission is hereby granted" in text:
-                label = "MIT"
-            else:
-                labels = {value for ending, value in CLASSIFIERS.items() if any(c.endswith(":: " + ending) for c in package["classifiers"])}
-                if len(labels) == 1:
-                    label = labels.pop()
-        # BSD classifiers omit the clause count; project evidence must specify it.
-        evidence = manifest.get("dependency_licenses", {}).get(name.lower())
-        if evidence and isinstance(evidence, dict) and evidence.get("version") == package["version"] and any(evidence.get("sha256") == f["hash"] for f in package["license_files"]):
-            label = evidence.get("spdx")
-        disposition = evidence.get("owner_disposition") if isinstance(evidence, dict) else None
-        accepted = (not package["license_files"] and isinstance(disposition, dict)
-                    and evidence.get("version") == package["version"]
-                    and disposition.get("reviewed") is True
-                    and isinstance(disposition.get("source_url"), str) and bool(disposition["source_url"].strip())
-                    and compatible_license(disposition.get("spdx"))
-                    and (compatible_license(label) or (not label and not (package["license"] or "").strip())))
-        if accepted:
-            label = disposition["spdx"]
-            dispositions.append({"package": name, "version": package["version"], "owner_disposition": disposition})
-        # Conservative SPDX expression handling: unknown or copyleft branches block.
-        if not compatible_license(label) or (not package["license_files"] and not accepted):
-            scanner.add("verification", "license", "dependency-license-review", "@dependency/" + name, value=json.dumps(package, sort_keys=True))
+        if not isinstance(package, dict):
+            return invalid()
+        if package.get('metadata_invalid'):
+            return invalid()
+        if package.get("metadata_limit"):
+            limit()
             count += 1
-    return {"packages": len(packages), "blocked": count, "owner_dispositions": dispositions}
+            continue
+        if not valid_dependency_metadata(package):
+            return invalid()
+        name = package["name"]
+        normalized = re.sub(r"[-_.]+", "-", name).lower()
+        if normalized in project_names:
+            continue  # The project's root licence is checked separately.
+        expressions = [package.get("expression") or "", *package.get("expressions", [])]
+        legacy = [package.get("license") or "", *package.get("licenses", [])]
+        if any(licence_expression_limited(value) for value in expressions) or any(
+                len(value.encode()) > MAX_LICENSE_BYTES for value in legacy):
+            limit()
+            count += 1
+            continue
+        states = [licence_expression(value) for value in expressions
+                  if value.strip() and label_key(value) not in HARMLESS_LICENSE_PLACEHOLDERS]
+        for value in legacy:
+            if not value.strip() or label_key(value) in HARMLESS_LICENSE_PLACEHOLDERS:
+                continue
+            state = licence_expression(value)
+            if state != 'accepted':
+                text_state = licence_file_state(value)
+                # Complete canonical LGPL/MPL text may legitimately quote GPL.
+                # Declarations/restrictions still prevent full-text acceptance.
+                state = ('accepted' if text_state == 'accepted' else
+                         next((s for s in ('strong', 'proprietary', 'unknown') if s in (state, text_state))))
+            states.append(state)
+        states += [state for c in package.get("classifiers", [])
+                   if licence_characters(c).strip().casefold().startswith("license")
+                   if (state := licence_classifier(c)) is not None]
+        files = package["license_files"]
+        if (len(files) > MAX_LICENSE_FILES or any(len(f['text'].encode()) > MAX_LICENSE_BYTES for f in files)
+                or any(licence_expression_limited(d) for f in files for d in
+                       re.findall(r'^[ \t]*SPDX-License-Identifier:[ \t]*([^\r\n]+)$', f['text'], re.I | re.M))):
+            limit()
+            count += 1
+            continue
+        licence_files = [f for f in files if licence_evidence_file(f["path"], f.get("declared", False))]
+        file_states = []
+        for f in files:
+            state = licence_file_state(f.get("text", ""))
+            file_states.append("unknown" if state == "accepted" and f not in licence_files else state)
+        all_states = [*states, *file_states]
+        state = next((s for s in ("strong", "proprietary", "unknown") if s in all_states),
+                     "accepted" if "accepted" in all_states else "unknown")
+        if state == "accepted" and not any(s == "accepted" for s in states):
+            accepted_files.append(scanner.safe_path("@dependency/" + name))
+        entries = [value for key, value in manifest.get('dependency_licenses', {}).items()
+                   if re.sub(r'[-_.]+', '-', key).lower() == normalized]
+        if len(entries) > 1:
+            return invalid()  # aliases must not select weaker evidence by ordering
+        evidence = entries[0] if entries else None
+        evidence_bound = (isinstance(evidence, dict)
+                          and evidence.get("version") == package["version"]
+                          and isinstance(evidence.get("sha256"), str)
+                          and bool(re.fullmatch(r"[a-f0-9]{64}", evidence["sha256"]))
+                          and any(evidence["sha256"] == f["hash"] for f in licence_files))
+        if evidence_bound:
+            if not isinstance(evidence.get('spdx', ''), str):
+                return invalid()
+            if licence_expression_limited(evidence.get('spdx', '')):
+                limit()
+                count += 1
+                continue
+        evidence_state = licence_expression(evidence.get("spdx", "")) if evidence_bound else None
+        # Supplied evidence can add a blocker but cannot lower a package's own
+        # strong/proprietary state. An accepted resolution stays a visible review.
+        if state not in {"strong", "proprietary"} and evidence_state in {"strong", "proprietary", "unknown"}:
+            state = evidence_state
+        evidence_review = (state == "unknown" and evidence_state == "accepted"
+                           and all(file_state != 'unknown' or
+                                   (f in licence_files and readable_licence(f['text'])
+                                    and f['hash'] == evidence['sha256'])
+                                   for f, file_state in zip(files, file_states)))
+        if state != "accepted":
+            bound = {**package, "license_files": [{k: v for k, v in f.items() if k != "text"} for f in files]}
+            if evidence is not None:
+                bound["dependency_license_evidence"] = evidence
+            finding = scanner.add("verification", "license", "dependency-license-review", "@dependency/" + name,
+                                  value=json.dumps(bound, sort_keys=True),
+                                  details={"reviewed": True, "review_source": "dependency_licenses"} if evidence_review else None)
+            count += not finding["reviewed"]
+    return {"packages": len(packages), "blocked": count, "accepted_on_license_file": accepted_files}
 
 
-def verification_venv(workspace: Path, timeout: int) -> tuple[Path | None, bytes, str]:
-    """Use the current Python first; external builders get the same clean HOME."""
-    env_dir = workspace / "venv"
-    environment = safe_environment(workspace / "home", Path(sys.executable).parent)
-    attempts = [("venv", [sys.executable, "-m", "venv", str(env_dir)])]
-    uv = shutil.which("uv")
-    virtualenv = shutil.which("virtualenv")
-    if uv:
-        attempts.append(("uv", [uv, "venv", "--seed", "--python", sys.executable, str(env_dir)]))
-    if virtualenv:
-        attempts.append(("virtualenv", [virtualenv, "--python", sys.executable, str(env_dir)]))
-    output = b""
-    for route, argv in attempts:
-        if env_dir.exists():
-            shutil.rmtree(env_dir)
-        code, output = command(argv, workspace, environment, timeout)
-        python = env_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-        if not code and python.is_file():
-            return python, output, route
-    return None, output, "not-run"
+def requirements_text() -> str:
+    example = {
+        "exclude": [], "approvals": [{"scope": "verification", "kind": "dependency-license-review", "path": "@dependency/example", "fingerprint": "0123456789abcdef", "reason": "Reviewed the exact installed licence evidence and accepted it."}],
+        "quickstart": [{"file": "README.md", "line": 3, "argv": ["python", "-m", "pip", "install", "."]}],
+        "checks": [{"role": "tests", "argv": ["python", "-m", "unittest", "discover", "-s", "tests", "-q"]}],
+        "dependency_licenses": {"example": {"version": "1.0", "spdx": "MIT", "sha256": "0" * 64}}
+    }
+    return "\n".join([
+        "Release requirements (no repository needed):",
+        "Root licence: one of " + ", ".join(ROOT_LICENSE_FILES) + " (case insensitive); a known SPDX identifier or intact known SPDX text. pyproject.toml and package.json declarations must agree.",
+        "Required root documents: " + ", ".join(REQUIRED_DOCUMENTS) + ".",
+        "README.md Markdown heading containing (case insensitive): " + ", ".join(README_HEADINGS) + ".",
+        "Issue template: " + ISSUE_TEMPLATE_DIR + "/ with a file matching " + " or ".join(ISSUE_TEMPLATE_GLOBS) + " (.md, .yml or .yaml).",
+        "Tests: at least one " + TEST_DIR + "/" + TEST_GLOB + " (subdirectories allowed).",
+        "release-check.json keys: " + ", ".join(MANIFEST_KEYS) + ". license is a legacy optional field, not an override.",
+        "exclude: relative path/glob strings. approvals: objects with scope, kind, path, fingerprint.",
+        "Denylist hits and secrets cannot be waived.",
+        "Alphabetic private terms: case-insensitive whole words only, bounded by non-word characters (letters, digits and underscores are word characters). Terms containing nonletters match literal strings. No embedded-word matching or review class.",
+        "Dependency approvals also require a nonempty reason. Copy scope, kind, path and fingerprint from the report; the fingerprint binds name, exact version, metadata, all licence-file hashes and any supplied dependency_licenses entry. Stale reviews stop applying; reviewed findings remain visible.",
+        "quickstart: nonempty entries with file, one-based line, argv (a nonempty string array); the documentation line must shell-split to exactly argv.",
+        "checks: nonempty entries with argv; at least one role=tests. Accepted roles: " + ", ".join(CHECK_ROLES) + ".",
+        "Configured checks: " + ", ".join(name + " requires role=" + role for name, role in CONFIGURED_CHECKS) + ".",
+        "dependency_licenses: normalized package-name keys with exact version, spdx expression, sha256 (full installed licence-document digest); existing lowercase-name keys also work, but conflicting aliases block coverage. Resolutions remain visible as reviewed findings; evidence cannot erase GPL/AGPL or proprietary indications, even after parsing fails, or waive another unknown file. Empty/corrupt/binary files cannot supply resolutions.",
+        "Recognised permissive identifiers: " + ", ".join(sorted(COMPATIBLE)) + ". Human-readable metadata/classifiers are also recognised.",
+        "Unlabelled file evidence: plain document named LICENSE/LICENCE, COPYING, COPYRIGHT or UNLICENSE, a licence identifier such as GPL-3.0.txt, a file under licenses/licences, or a document declared by License-File metadata. Complete recognised text or an SPDX-only declaration is required. Empty/binary, source and markup files do not qualify. NOTICE alone is not a licence file: NOTICE files are scanned for assertions but cannot establish acceptance or supply digest evidence, even if declared by License-File.",
+        "Dependency policy: recognised permissive and weak copyleft accepted; GPL/AGPL or proprietary indications from independent sources win. Unknown licences need review. Unlabelled packages need recognizable permissive/weak-copyleft text or valid SPDX declarations. OR needs an acceptable branch; otherwise stronger indications survive. AND needs every part acceptable. License :: OSI Approved alone is neutral. Missing inventory/files, corrupt metadata, malformed headers and duplicate JSON keys block coverage.",
+        "Example manifest for your own repository (assumes its README line 3 is: python -m pip install .; adjust file, line and argv to match your documentation):",
+        json.dumps(example, indent=2),
+        "Passing also requires an external denylist, complete local history, no unresolved denylist/secret/media/metadata findings, and --verify in a fresh clone/venv/HOME. Install the project and test tools through declared commands. Export rescans a clean one-commit copy; nothing is published."
+    ]) + "\n"
 
 
-def verification_argv(argv: list[str], python: Path) -> list[str]:
-    """Resolve portable Python launchers to the selected verification interpreter."""
-    if argv[0] in {"python", "python3", "python" + str(sys.version_info.major) + "." + str(sys.version_info.minor)}:
-        return [str(python), *argv[1:]]
-    if argv[0] == "py":
-        return [str(python), *argv[2 if argv[:2] == ["py", "-3"] else 1:]]
-    return list(argv)
+def venv_failure(output: bytes, scanner: Scanner, ensurepip_missing: bool = False) -> dict:
+    text = output.decode("utf-8", errors="replace")
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    normalized = " ".join(text.split())
+    missing = ensurepip_missing or bool(re.search(r"ensurepip (?:is not available|is missing)|No module named ['\"]?ensurepip|cannot import (?:name )?['\"]?ensurepip", normalized, re.I))
+    if missing:
+        return {"cause": "missing-ensurepip", "message": f"Python {version} venv support is missing (ensurepip). On Debian/Ubuntu install python{version}-venv; on other systems install or enable the Python {version} venv/ensurepip support, then retry."}
+    # Unlike command output, a venv diagnostic tail is useful. Apply the existing
+    # privacy rules and additionally remove all absolute paths before reporting it.
+    # Diagnostic paths are not shell tokens: spaces and quotes can be part of a
+    # filename. Discard through the end of the line rather than risk a partial path.
+    text = re.sub(r"(?:[A-Za-z]:[\\/]|(?<![\w\\])\\\\|(?<![\w/\\])/)[^\r\n]*", "[redacted]", text)
+    for term in scanner.terms:
+        text = re.sub(re.escape(term), "[redacted]", text, flags=re.I)
+    for value in scanner.private_repos:
+        text = re.sub(re.escape(value), "[redacted]", text, flags=re.I)
+    for pattern in [*SECRET_PATTERNS.values(), r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)", r"(?<![\w:])[0-9A-Fa-f]*:[0-9A-Fa-f:]+(?:%[\w-]+)?(?![\w:])"]:
+        text = re.sub(pattern, "[redacted]", text, flags=re.I)
+    text = re.sub(r"[A-Za-z0-9_+=-]{32,}", lambda m: "[redacted]" if opaque_secret(m.group()) else m.group(), text)
+    tail = "".join(c for c in text if c in "\n\t" or c.isprintable()).strip()[-1000:]
+    return {"cause": "other-venv-error", "message": f"Python {version} virtual environment creation failed; the error does not identify missing ensurepip. See the redacted error tail.", "error_tail": tail}
 
 
 def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int) -> dict:
-    return verify_with_mode(repo, report_dir, scanner, manifest, timeout)
-
-
-def verify_with_mode(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int, no_venv: bool = False) -> dict:
     results = []
-    result = {"status": "blocked", "commands": results, "dependencies": None,
-              "isolation": "current-interpreter (less isolated)" if no_venv else "venv"}
-    validate_commands(manifest)
-    if no_venv:
-        project = tomllib.loads((repo / "pyproject.toml").read_text()).get("project", {}) if (repo / "pyproject.toml").exists() else {}
-        if not manifest.get("stdlib_only") or project.get("dependencies") or project.get("optional-dependencies") or project.get("dynamic"):
-            scanner.add("verification", "quality", "no-venv-not-stdlib", "release-check.json")
-            return result
+    result = {"status": "blocked", "commands": results, "dependencies": None}
     if not manifest["quickstart"] or not manifest["checks"]:
         scanner.add("verification", "quality", "verification-not-configured", "release-check.json")
         return result
     for item in [*manifest["quickstart"], *manifest["checks"]]:
-        argv = item["argv"]
+        if item.get("role", "quickstart") not in CHECK_ROLES:
+            raise AuditError("command-role")
+        argv = item.get("argv")
+        if not isinstance(argv, list) or not argv or any(not isinstance(a, str) or "\0" in a for a in argv):
+            raise AuditError("command-schema")
         if item in manifest["quickstart"]:
             doc = item.get("file", "README.md")
-            if not (repo / doc).is_file():
-                scanner.add("verification", "quality", "quickstart-document-missing", doc)
-                return result
-            try:
-                lines = (repo / doc).read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                scanner.add("verification", "quality", "quickstart-document-missing", doc)
-                return result
+            if Path(doc).is_absolute() or ".." in Path(doc).parts:
+                raise AuditError("quickstart-document-path")
+            lines = (repo / doc).read_text().splitlines()
             number = item.get("line", 0)
             if not isinstance(number, int) or not 1 <= number <= len(lines) or shlex.split(lines[number - 1]) != argv:
                 scanner.add("verification", "quality", "quickstart-document-mismatch", doc, number if isinstance(number, int) else 0)
@@ -1163,27 +1111,24 @@ def verify_with_mode(repo: Path, report_dir: Path, scanner: Scanner, manifest: d
         copy_tree(repo, snapshot, manifest, scanner)
         clean = workspace / "clean"
         git(workspace, "clone", "-q", "--no-local", str(snapshot), str(clean))
-        if no_venv:
-            python = Path(sys.executable)
-        else:
-            python, output, route = verification_venv(workspace, timeout)
-            result["isolation"] = route
-            if python is None:
-                scanner.add("verification", "quality", "venv-creation-failed", "release-check.json", value=output)
-                return result
-        bin_dir = python.parent
-        environment = safe_environment(workspace / "home", bin_dir)
+        env_dir = workspace / "venv"
+        creation_environment = safe_environment(workspace / "home", Path("/usr/bin"))
+        code, output = command([sys.executable, "-m", "venv", str(env_dir)], workspace, creation_environment, timeout)
+        if code:
+            # Probe the same interpreter/environment; only a missing ensurepip module
+            # identifies absent support. Import errors inside ensurepip are different.
+            probe = "import sys\ntry:\n import ensurepip\nexcept ModuleNotFoundError as error:\n sys.exit(3 if error.name == 'ensurepip' else 4)"
+            probe_code, _ = command([sys.executable, "-c", probe], workspace, creation_environment, timeout)
+            scanner.add("verification", "quality", "venv-creation-failed", "release-check.json", value=output, details=venv_failure(output, scanner, ensurepip_missing=probe_code == 3))
+            return result
+        environment = safe_environment(workspace / "home", env_dir / "bin")
         for step, item in enumerate([*manifest["quickstart"], *manifest["checks"]], 1):
-            argv = verification_argv(item["argv"], python)
-            code, output = command(argv, clean, environment, timeout)
+            code, output = command(item["argv"], clean, environment, timeout)
             results.append({"step": step, "role": item.get("role", "quickstart"), "exit_code": code, "output_fingerprint": fingerprint(output)})
             if code:
-                scanner.add("verification", "quality", "command-not-found" if code == 127 and output == MISSING_EXECUTABLE_OUTPUT else "command-failed", item.get("file", "release-check.json"), item.get("line", 0), output)
+                scanner.add("verification", "quality", "command-failed", item.get("file", "release-check.json"), item.get("line", 0), output)
                 return result
-        if no_venv:
-            result["status"] = "pass"
-            return result
-        code, output = command([str(python), "-c", METADATA_SCRIPT], clean, environment, timeout)
+        code, output = command([str(env_dir / "bin/python"), "-c", METADATA_SCRIPT], clean, environment, timeout)
         if code:
             scanner.add("verification", "license", "dependency-metadata-failed", "pyproject.toml", value=output)
         else:
@@ -1191,7 +1136,14 @@ def verify_with_mode(repo: Path, report_dir: Path, scanner: Scanner, manifest: d
         # Verification must really install declared packages, not merely run help.
         if (clean / "pyproject.toml").exists():
             project = tomllib.loads((clean / "pyproject.toml").read_text()).get("project", {})
-            installed = {p["name"].lower().replace("_", "-") for p in json.loads(output)} if not code else set()
+            # Invalid metadata has already added an unwaivable coverage finding.
+            # Do not let this secondary presence check raise another exception.
+            try:
+                packages = json.loads(output) if not code else []
+                installed = {p["name"].lower().replace("_", "-") for p in packages
+                             if isinstance(p, dict) and isinstance(p.get("name"), str)} if isinstance(packages, list) else set()
+            except (ValueError, RecursionError):
+                installed = set()
             if project.get("name", "").lower().replace("_", "-") not in installed:
                 scanner.add("verification", "quality", "project-not-installed", "pyproject.toml")
         result["status"] = "pass" if not code and result["dependencies"]["blocked"] == 0 else "blocked"
@@ -1199,405 +1151,100 @@ def verify_with_mode(repo: Path, report_dir: Path, scanner: Scanner, manifest: d
 
 
 def audit(repo: Path, terms: list[str], manifest: dict, private_repos: list[str], verify_commands: bool, report_dir: Path, timeout: int) -> dict:
-    return audit_with_mode(repo, terms, manifest, private_repos, verify_commands, report_dir, timeout)
-
-
-def audit_with_mode(repo: Path, terms: list[str], manifest: dict, private_repos: list[str], verify_commands: bool, report_dir: Path, timeout: int, no_venv: bool = False) -> dict:
     scanner = Scanner(terms, private_repos, manifest["approvals"])
     scanner.tree(repo)
     scanner.history(repo)
     licensing = license_audit(repo, scanner, manifest)
     quality_audit(repo, scanner, manifest)
     if verify_commands:
-        verification = verify_with_mode(repo, report_dir, scanner, manifest, timeout, True) if no_venv else verify(repo, report_dir, scanner, manifest, timeout)
+        verification = verify(repo, report_dir, scanner, manifest, timeout)
         if verification.get("dependencies") is not None:
             licensing["dependencies"] = "pass" if not verification["dependencies"]["blocked"] else "blocked"
     else:
         verification = {"status": "not-run", "commands": []}
         scanner.add("verification", "quality", "verification-not-run", "release-check.json")
-    unresolved = [f for f in scanner.findings if not f["reviewed"]]
-    return {"version": VERSION, "ready": not unresolved, "counts": dict(Counter(f["category"] for f in unresolved)), "reviewed_count": sum(f["reviewed"] for f in scanner.findings), "stats": dict(scanner.stats), "license": licensing, "verification": verification, "findings": scanner.findings}
-
-
-def group_of(finding: dict) -> str:
-    return next((label for label, test in GROUPS if test(finding)), "scan coverage")
-
-
-def fix_for(finding: dict) -> str:
-    scope = finding["scope"]
-    if finding.get("why") == "source-only" and scope in {"history", "metadata"}:
-        return "Informational: this finding belongs to the SOURCE repository. Its history and Git metadata were not copied into the export. Keep the source private." + (" Revoke any exposed credential at the provider." if finding["category"] == "secrets" else "")
-    snapshot = finding.get("origin") == "export" and scope in {"history", "metadata"}
-    if finding["kind"] == "missing-document":
-        return {
-            "CONTRIBUTING.md": "Create CONTRIBUTING.md with instructions for setting up development, running tests and proposing changes.",
-            "SECURITY.md": "Create SECURITY.md with supported versions and a private way to report vulnerabilities.",
-        }.get(finding["path"], FIXES["missing-document"])
-    if finding["category"] == "personal" and finding["kind"] != "denylist":
-        if finding.get("reviewed"):
-            return f'Approval covers only scope "{scope}". Other scopes require separate approvals.'
-        if finding["kind"] == "email" and scope == "metadata" and (finding["path"].startswith("@commit/") or finding["path"] == "@config"):
-            return "Git contains an author or committer email address. Use --verify --export to make a one-commit copy with generic authorship and no source Git config. Keep the original history private. Editing working files cannot remove commit metadata; do not approve a real personal address just to pass."
-        approval = f'This finding still lacks approval in scope "{scope}". A deliberate public example needs an approval for this scope in release-check.json.'
-        return approval + " " + (HISTORY_FIX if scope in {"history", "metadata"} and not snapshot else FIXES[finding["kind"]])
-    if finding["scope"] in {"history", "metadata"} and finding["category"] in {"personal", "secrets"} and not snapshot:
-        return HISTORY_FIX + (" Revoke the credential at the provider." if finding["category"] == "secrets" else "")
-    return FIXES.get(finding["kind"], "Review this item by hand and run again.")
-
-
-def finding_location(finding: dict) -> str:
-    path, line = finding["path"], finding["line"]
-    if path.startswith("@commit/"):
-        field = {1: "author metadata", 2: "committer metadata"}.get(line, "message or encoding metadata")
-        return "commit " + finding.get("object", path.removeprefix("@commit/")) + " " + field
-    if path == "@config":
-        return ".git/config (local Git configuration, entry " + str(line) + ")"
-    return path + (":" + str(line) if line else "")
-
-
-def record_export_audit(target: Path, report: dict) -> dict:
-    classification = classify(report)
-    verification = report["verification"]
-    record = {"format": 1, "verdict": classification["verdict"],
-              "blocking_count": len(classification["blocking"]),
-              "verified": verification["status"] == "pass",
-              "isolation": verification.get("isolation", "not-run"),
-              "commit": git(target, "rev-parse", "HEAD").strip().decode("ascii")}
-    path = target / ".git" / AUDIT_RECORD
-    path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
-    path.chmod(0o600)
-    return record
-
-
-def read_export_audit(target: Path) -> dict | None:
-    try:
-        blocked = blocked_artifact(target)
-        record = json.loads((target / AUDIT_RECORD if blocked else target / ".git" / AUDIT_RECORD).read_text(encoding="utf-8"))
-        if (not isinstance(record, dict) or type(record.get("format")) is not int or record["format"] != 1
-                or record.get("verdict") not in {"PASS", "FIX-THESE"}
-                or type(record.get("blocking_count")) is not int or record["blocking_count"] < 0
-                or type(record.get("verified")) is not bool
-                or record.get("isolation") not in {"venv", "uv", "virtualenv", "current-interpreter (less isolated)", "not-run"}
-                or (record["verified"] and record["isolation"] == "not-run")
-                or (not blocked and record.get("commit") != git(target, "rev-parse", "HEAD").strip().decode("ascii"))
-                or (record["verdict"] == "PASS" and (record["blocking_count"] != 0 or not record["verified"]))):
-            return None
-        return record
-    except (OSError, ValueError, TypeError, AuditError):
-        return None
-
-
-def classify(report: dict) -> dict:
-    target = report.get("export", report)
-    key = lambda f: tuple(f[k] for k in ("category", "kind", "path", "line", "fingerprint"))
-    blocking, warnings = [], []
-    for finding in target["findings"]:
-        finding["group"] = group_of(finding)
-        finding.pop("why", None)
-        if finding["reviewed"]:
-            finding.update(severity="warning", why="acknowledged")
-            warnings.append(finding)
-        else:
-            finding["severity"] = "blocking"
-            blocking.append(finding)
-    if "export" in report:
-        target_keys = {key(f) for f in target["findings"]}
-        for finding in report["findings"]:
-            finding["group"] = group_of(finding)
-            finding.pop("why", None)
-            finding["severity"] = "warning" if finding["reviewed"] else "blocking"
-            if finding["reviewed"]:
-                finding["why"] = "acknowledged"
-            if not finding["reviewed"] and (finding["scope"] in {"history", "metadata"} or key(finding) not in target_keys):
-                finding.update(severity="warning", why="source-only")
-                warnings.append(finding)
-    verdict = "PASS" if target["ready"] and not blocking else "FIX-THESE"
-    return {"verdict": verdict, "blocking": blocking, "warnings": warnings}
-
-
-def untracked_files(repo: Path, tracked: set[str]) -> list[str]:
-    submodules = submodule_paths(repo)
-    paths = []
-    for root, dirs, files in os.walk(repo, followlinks=False):
-        relative = Path(root).relative_to(repo)
-        dirs[:] = [d for d in dirs if d != ".git" and (relative / d).as_posix() not in submodules and (d not in GENERATED or any(p.startswith((relative / d).as_posix() + "/") for p in tracked))]
-        for name in files + [d for d in dirs if (Path(root) / d).is_symlink()]:
-            rel = (relative / name).as_posix()
-            if name != ".git" and rel not in tracked:
-                paths.append(rel)
-    return sorted(paths)
+    findings = scanner.findings
+    unresolved = [f for f in findings if not f["reviewed"]]
+    def safe_approval_value(key, value):
+        if key == "path" and isinstance(value, str):
+            return scanner.safe_path(value)
+        if any(term.casefold() in str(value).casefold() for term in terms):
+            return "[redacted]"
+        return value
+    stale_approvals = [
+        {key: safe_approval_value(key, approval[key])
+         for key in ("scope", "kind", "path", "fingerprint") if key in approval}
+        for index, approval in enumerate(manifest["approvals"]) if index not in scanner.matched_approvals
+    ]
+    return {"version": VERSION, "ready": not unresolved, "counts": dict(Counter(f["category"] for f in unresolved)), "reviewed_count": sum(f["reviewed"] for f in scanner.findings), "stale_approvals": stale_approvals, "stats": dict(scanner.stats), "license": licensing, "verification": verification, "findings": findings}
 
 
 def scrub_plan(report: dict, repo: Path, manifest: dict, scanner: Scanner) -> dict:
-    tracked = {os.fsdecode(p) for p in git(repo, "ls-files", "-z").split(b"\0") if p}
-    excluded = [*DEFAULT_EXCLUDES, *manifest["exclude"]]
-    drop = [scanner.safe_path(p) for p in tracked if credential_file(p) or any(match_path(a.as_posix(), excluded) for a in (Path(p), *Path(p).parents) if a.as_posix() != ".")]
-    left = untracked_files(repo, tracked)
-    unresolved = [f for f in report["findings"] if not f["reviewed"]]
-    history = [f for f in unresolved if f["scope"] in {"history", "metadata"}]
-    classes = {label: {"history": 0, "files": 0} for label, _ in GROUPS[:6]}
-    for finding in unresolved:
-        label = group_of(finding)
-        if label in classes and finding["scope"] in {"tree", "history", "metadata"}:
-            classes[label]["files" if finding["scope"] == "tree" else "history"] += 1
-    return {
-        "working_changes": bool(git(repo, "status", "--porcelain", "--untracked-files=no")),
-        "drop_files": sorted(drop),
-        "replace_or_remove": [f for f in unresolved if f["scope"] == "tree" and f["category"] in {"personal", "secrets"}],
-        "flatten_history": True,
-        "review_media": [f for f in unresolved if f["category"] == "media"],
-        "preserve_attribution": True,
-        "not_exported": [scanner.safe_path(p) for p in left[:50]],
-        "not_exported_count": len(left),
-        "history": {"commits": report["stats"].get("history_commits", 0), "findings": len(history)},
-        "by_class": classes,
-    }
-
-
-def build_plan(report: dict, scrub: dict) -> list[dict]:
-    target = report.get("export", report)
-    steps = []
-    def add(identifier, actor, text, status=None):
-        steps.append({"id": identifier, "actor": actor, "status": status or ("needed" if actor == "you" else "done" if "export" in report else "planned"), "text": text})
-    commits = scrub['history']['commits']
-    add("read", "tool", f"Read the SOURCE working files and all {commits} {'commit' if commits == 1 else 'commits'} of local history. Change nothing in the repository.", "done")
-    if scrub["drop_files"]:
-        add("drop-excluded", "tool", f"Leave out {len(scrub['drop_files'])} tracked files that match the built-in or manifest exclusions.")
-    if scrub["not_exported_count"]:
-        add("leave-untracked", "tool", f"Leave out {scrub['not_exported_count']} files git does not track. They stay in your folder.")
-    add("drop-history", "tool", f"Discard all history. The export gets one new commit. This removes {scrub['history']['findings']} findings from history and commit metadata; matching working-file content still needs fixing.")
-    add("generic-commit", "tool", "Write that commit with a generic author, a UTC date, no remote and no hooks.")
-    add("keep-notices", "tool", "Copy license and notice files unchanged. Stop if one from history is missing.")
-    blocking = [f for f in target["findings"] if not f["reviewed"]]
-    content = [f for f in blocking if f["scope"] == "tree" and f["category"] in {"personal", "secrets"}]
-    media = [f for f in blocking if f["scope"] == "tree" and f["category"] == "media"]
-    other = [f for f in blocking if f["scope"] == "tree" and f not in content and f not in media]
-    if content:
-        counts = Counter(group_of(f) for f in content)
-        classes = ", ".join(f"{label}: {counts[label]}" for label, _ in GROUPS if counts[label])
-        add("fix-content", "you", f"Edit {len(content)} findings in files that will ship, then run again: {classes}.")
-    if other:
-        add("fix-other", "you", f"Fix {len(other)} license, documentation, test or coverage items listed under BLOCKING.")
-    if media:
-        add("review-media", "you", f"Look at {len(media)} media or binary files and record each approval in release-check.json.")
-    add("rescan", "tool", "Scan the export again, including its new commit.")
-    if target["verification"]["status"] != "not-run":
-        verified = target["verification"]["status"] == "pass" and not any(f["scope"] == "verification" for f in blocking)
-        add("verify", "tool", "Run the declared quickstart and checks in a fresh clone with an empty HOME and a new virtual environment.", "done" if verified else "planned")
-    else:
-        add("verify", "you", "Run again with --verify so the declared commands are executed.")
-    add("digest", "tool", "Record the export digest so you can prove later that nothing changed.")
-    add("publish", "you", "Publish only after a clean export verdict, a PASS from --check-digest, the test list and owner approval. release-check never publishes.")
-    return steps
-
-
-def test_list(report: dict, manifest: dict, scanner: Scanner) -> list[dict]:
-    target = report.get("export", report)
-    results = {r["step"]: r for r in target["verification"].get("commands", [])}
-    items = []
-    def automatic(identifier, step, text):
-        result = results.get(step)
-        status = "not run" if result is None else "passed" if result["exit_code"] == 0 else "failed"
-        items.append({"id": identifier, "kind": "automatic", "status": status, "text": text})
-    def manual(identifier, text):
-        items.append({"id": identifier, "kind": "manual", "status": "to do", "text": text})
-    for number, entry in enumerate(manifest["quickstart"], 1):
-        path = entry.get("file", "README.md")
-        path = path if isinstance(path, str) else "README.md"
-        safe = scanner.safe_path(path)
-        if Path(path).is_absolute() or re.match(r"^[A-Za-z]:[\\/]", path):
-            safe = "[path-" + fingerprint(path) + "]"
-        line = entry.get("line", 0)
-        line = line if type(line) is int else 0
-        automatic(f"quickstart-{number}", number, f"Quickstart step {number} ({safe} line {line}) works in a clean clone.")
-    for number, entry in enumerate(manifest["checks"], 1):
-        role = entry.get("role")
-        role = role if isinstance(role, str) and role in ROLES else "other"
-        automatic(f"check-{number}", len(manifest["quickstart"]) + number, f"The declared {role} check (release-check.json checks, entry {number}) passes in a clean clone.")
-    findings = report["findings"] + (target["findings"] if "export" in report else [])
-    history = sum(not f["reviewed"] and f["scope"] in {"history", "metadata"} for f in report["findings"])
-    manual("fresh-clone", "Clone the export into an empty folder, ideally on another machine or user account, and follow the README from its first line. Nothing may depend on files, tools or logins only you have.")
-    if "export" in report:
-        manual("inspect-commit", "Read the export's single commit with `git log --format=fuller -1`. Author, committer, date and message must be generic.")
-    manual("publish-export-not-original", f"Only after a clean export verdict, PASS from --check-digest and owner approval, publish the export folder as a new repository. Do not switch the original repository to public: its old commits were not rewritten ({history} findings in history).")
-    if any(f["category"] == "secrets" for f in findings):
-        manual("rotate-credentials", "Revoke or replace every credential the audit found, including those only in old commits.")
-    media = {f["path"] for f in findings if f["category"] == "media"}
-    if media:
-        manual("review-media", f"Open each of the {len(media)} media or binary files and check its contents and embedded metadata.")
-    manual("license-holder", "Confirm the license and the copyright line name who you want shown publicly.")
-    if target["license"].get("dependencies") != "stdlib-only" or any(f["kind"] in {"vendored-attribution-review", "dependency-ecosystem-manual-review"} for f in findings):
-        manual("third-party", "Check that every dependency and every copied file has a license that allows redistribution, and that its notice is kept.")
-    manual("hosting-side", "Check what this tool cannot see on the hosting site: repository name and description, topics, issues, pull requests, wiki, releases, CI logs and stored secrets.")
-    if any(f["kind"] in {"manual-review", "binary-review", "lfs-content-not-scanned", "submodule", "symlink"} for f in findings):
-        manual("unreadable-content", "Check content this tool cannot read: text inside images, archives, large-file objects, submodules and link targets.")
-    if "export" in report:
-        digest = target.get("digest", "DIGEST")
-        manual("confirm-digest", f"Immediately before publishing, run `release-check <export-folder> --check-digest {digest}` and publish only if it says PASS.")
-    manual("after-publish", "Right after publishing, open the public page while signed out and repeat the quickstart from there.")
-    return items
-
-
-def format_text(report: dict) -> str:
-    target = report.get("export", report)
-    classified = {
-        "blocking": [f for f in target["findings"] if not f["reviewed"]],
-        "warnings": [f for f in target["findings"] if f["reviewed"]] +
-                    ([f for f in report["findings"] if f.get("why") == "source-only"] if "export" in report else []),
-    }
-    verdict = report.get("verdict", "INCOMPLETE")
-    lines = [f"release-check {report['version']}", "", f"VERDICT: {verdict}"]
-    if verdict == "PASS":
-        lines.append("The declared checks passed and no detected findings block the judged target. Finish TEST BEFORE PUBLISHING and manual review.")
-        lines.append(PASS_LIMITATIONS)
-    if len(classified['blocking']) == 1 and classified['blocking'][0]['kind'] == 'verification-not-run':
-        lines.append("No content or repository problems found. The single reason for FIX-THESE is verification-not-run: run with --verify.")
-    if any(f['kind'] == 'venv-creation-failed' for f in classified['blocking']):
-        lines.append("Verification could not create a venv; quickstart and tests did not run.")
-        lines.append("No-admin fix: install uv into your home with the official script (README), then re-run --verify; or use --verify-no-venv for a declared stdlib-only project. Details follow under BLOCKING.")
-    lines += ["Judged: " + ("the export (one commit, no history)" if "export" in report and target['ready'] else "the blocked export snapshot (no Git repository, no history)" if "export" in report else "the source repository"),
-              f"Blocking: {len(classified['blocking'])}   Warnings: {len(classified['warnings'])}"]
-    if "export" in report and not target["ready"]:
-        lines.append("WARNING: " + BLOCKED_EXPORT_WARNING)
-    stats = target.get("stats", {})
-    commits = stats.get('history_commits', 0)
-    lines.append(f"Scanned: {stats.get('tree_files', 0)} working files, {commits} {'commit' if commits == 1 else 'commits'}" + (" in the temporary export snapshot; SOURCE history is informational" if "export" in report else ""))
-    if report.get("scrub_plan", {}).get("working_changes"):
-        lines.append("NOTICE: Tracked files have uncommitted or staged changes. Exports use current working bytes.")
-    for key, title in (("blocking", "BLOCKING - fix these, then run again"), ("warnings", "WARNINGS - reported, not blocking")):
-        lines += ["", title]
-        findings = classified[key]
-        if not findings:
-            lines.append("   none")
-        number = 0
-        for label, _ in GROUPS:
-            group = sorted((f for f in findings if group_of(f) == label), key=lambda f: (f["path"], f["line"], f["kind"]))
-            if not group:
-                continue
-            number += 1
-            why = ", " + ", ".join(sorted({f["why"] for f in group})) if key == "warnings" else ""
-            lines.append(f"{number}. {label} ({len(group)}{why})")
-            for finding in group[:10]:
-                location = finding_location(finding)
-                term = "   term " + str(finding["term_index"]) if "term_index" in finding else ""
-                scope = "export snapshot (approval scope " + finding['scope'] + ")" if finding.get('origin') == 'export' and finding['scope'] in {'history', 'metadata'} else "SOURCE " + finding['scope'] if finding.get('why') == 'source-only' else finding['scope']
-                lines.append(f"   {finding['kind']}   {location}   {scope}   id {finding['fingerprint']}{term}")
-            if len(group) > 10:
-                lines.append(f"   ... and {len(group) - 10} more in report.md")
-            for fix in dict.fromkeys(fix_for(f) for f in group):
-                lines.append("   Fix: " + fix)
-    dispositions = (target.get("verification", {}).get("dependencies") or {}).get("owner_dispositions", [])
-    if dispositions:
-        lines += ["", "OWNER LICENSE DISPOSITIONS (no installed license file)"]
-        lines += ["   " + json.dumps(item, sort_keys=True) for item in dispositions]
-    if target.get("license", {}).get("owner_disposition"):
-        lines += ["", "OWNER UPSTREAM LICENSE DISPOSITION (verbatim file evidence)",
-                  "   " + json.dumps(target["license"]["owner_disposition"], sort_keys=True)]
-    lines += ["", "PLAN"]
-    for number, step in enumerate(report.get("plan", []), 1):
-        lines.append(f" {number}. [{step['actor']}, {step['status']}] {step['text']}")
-    if report.get("scrub_plan", {}).get("by_class"):
-        lines.append("   Scrub class counts:")
-    for label, counts in report.get("scrub_plan", {}).get("by_class", {}).items():
-        lines.append(f"   {label}: {counts['files']} in SOURCE files, {counts['history']} in SOURCE history")
-    lines += ["", "TEST BEFORE PUBLISHING"]
-    for number, item in enumerate(report.get("pre_publish_tests", []), 1):
-        lines.append(f" {number}. [{item['status']}] {item['text']}")
-    if "export" in report and "digest" in report["export"]:
-        lines += ["", "Export digest: " + report["export"]["digest"]]
-        if not target["ready"]:
-            lines.append("Export folder: requested destination + .BLOCKED (never publish)")
-    verification = target.get("verification", {})
-    lines.append("Verification: " + ("verified" if verification.get("status") == "pass" else "not verified") + " (" + ("no-venv; " if verification.get("isolation", "").startswith("current-interpreter") else "") + verification.get("isolation", "not-run") + ")")
-    locator = report.get("report", "report.json").removesuffix("report.json")
-    lines += ["", "REPORT: " + locator + "report.md and report.json, under your reports folder"]
-    return ("\n".join(lines) + "\n").encode("ascii", "backslashreplace").decode("ascii")
-
-
-def format_markdown(report: dict) -> str:
-    lines = format_text(report).splitlines()
-    lines[0] = "# " + lines[0]
-    for index, line in enumerate(lines):
-        if line.startswith(("VERDICT:", "BLOCKING", "WARNINGS", "PLAN", "TEST BEFORE PUBLISHING", "REPORT:")):
-            lines[index] = "## " + line
-    lines += ["", "## All findings", "", "| Scope | Kind | Path | Line | Fingerprint | Term index | Reviewed |", "| --- | --- | --- | ---: | --- | ---: | --- |"]
-    findings = report["findings"] + report.get("export", {}).get("findings", [])
-    for finding in findings:
-        location = finding_location(finding) if finding["scope"] == "metadata" else finding["path"]
-        path = location.replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
-        origin = "export snapshot" if finding.get('origin') == 'export' else "SOURCE" if 'export' in report else "source"
-        lines.append(f"| {origin}: {finding['scope']} | {finding['kind']} | {path} | {finding['line']} | {finding['fingerprint']} | {finding.get('term_index', '')} | {finding['reviewed']} |")
-    target = report.get("export", report)
-    lines += ["", "License: " + json.dumps(target["license"], sort_keys=True), "", "Verification: " + json.dumps(target["verification"], sort_keys=True)]
-    return ("\n".join(lines) + "\n").encode("ascii", "backslashreplace").decode("ascii")
+    drop = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git" and d not in GENERATED]
+        for name in files:
+            rel = (Path(root) / name).relative_to(repo).as_posix()
+            if match_path(rel, [*DEFAULT_EXCLUDES, *manifest["exclude"]]):
+                drop.append(scanner.safe_path(rel))
+    replace = [f for f in report["findings"] if f["scope"] == "tree" and f["category"] in {"personal", "secrets"} and not f["reviewed"]]
+    return {"drop_files": sorted(drop), "replace_or_remove": replace, "flatten_history": True, "review_media": [f for f in report["findings"] if f["category"] == "media" and not f["reviewed"]], "preserve_attribution": True}
 
 
 def write_reports(directory: Path, report: dict):
-    markdown = format_markdown(report)
     content = json.dumps(report, indent=2, ensure_ascii=True) + "\n"
-    for name, text in (("report.json", content), ("report.md", markdown)):
+    md = ["# Release audit", "", "Ready: " + str(report["ready"]).lower(), "", "| Category | Unresolved |", "| --- | ---: |"]
+    md += [f"| {k} | {v} |" for k, v in report["counts"].items()]
+    md += ["", "License: " + json.dumps(report["license"], sort_keys=True), "", "Verification: " + json.dumps(report["verification"], sort_keys=True), "", "## Blocking and approved findings", "", "| Scope | Kind | Path | Line | Fingerprint | Term index | Status | Reason |", "| --- | --- | --- | ---: | --- | ---: | --- | --- |"]
+    diagnostics = []
+    for f in report["findings"]:
+        path = f["path"].replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
+        if "message" in f:
+            diagnostics.append(f["message"] + (" Error tail: " + json.dumps(f["error_tail"]) if "error_tail" in f else ""))
+        status = f.get("review_status", "reviewed" if f["reviewed"] else "blocking")
+        reason = f.get("reason", "").replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
+        md.append(f"| {f['scope']} | {f['kind']} | {path} | {f['line']} | {f['fingerprint']} | {f.get('term_index', '')} | {status} | {reason} |")
+    if report.get("stale_approvals"):
+        md += ["", "## Stale approvals", "", "These approvals matched no finding and should be removed or updated.", "", "| Scope | Kind | Path | Fingerprint |", "| --- | --- | --- | --- |"]
+        md += [f"| {a.get('scope', '')} | {a.get('kind', '')} | {a.get('path', '')} | {a.get('fingerprint', '')} |" for a in report["stale_approvals"]]
+    if diagnostics:
+        md += ["", *diagnostics]
+    if "export" in report:
+        md += ["", "## Export", "", "Ready: " + str(report["export"]["ready"]).lower(), "", "Counts: " + json.dumps(report["export"]["counts"], sort_keys=True), "", "Export findings and verification are in report.json."]
+    if "scrub_plan" in report:
+        md += ["", "## Scrub plan", "", "```json", json.dumps(report["scrub_plan"], indent=2), "```"]
+    for name, text in (("report.json", content), ("report.md", "\n".join(md) + "\n")):
         fd = os.open(directory / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w") as handle:
             handle.write(text)
 
 
 def main(argv: list[str] | None = None) -> int:
-    raw_args = list(sys.argv[1:] if argv is None else argv)
-    parser = PrivateParser(prog="release-check", description=__doc__, epilog="Audit first, fix the blockers, then export with --verify.")
-    parser.json_mode = "--json" in raw_args
-    parser.add_argument("repo", type=Path, help="Repository root to audit")
-    parser.add_argument("--denylist", type=Path, default=os.environ.get("RELEASE_CHECK_DENYLIST") or None, help="Private terms file outside the repository (or RELEASE_CHECK_DENYLIST)")
-    parser.add_argument("--reports", type=Path, default=os.environ.get("RELEASE_CHECK_REPORTS", "~/.local/state/release-check"), help="Private reports folder (or RELEASE_CHECK_REPORTS)")
-    parser.add_argument("--manifest", type=Path, help="Use an external manifest instead of release-check.json")
+    parser = PrivateParser(description=__doc__)
+    parser.add_argument("repo", type=Path, nargs="?")
+    parser.add_argument("--requirements", action="store_true", help="Print required files, README headings and manifest shape without scanning")
+    parser.add_argument("--denylist", type=Path, default=os.environ.get("RELEASE_CHECK_DENYLIST") or None, help="External terms file (default: RELEASE_CHECK_DENYLIST)")
+    parser.add_argument("--reports", type=Path, default=os.environ.get("RELEASE_CHECK_REPORTS", "~/.local/state/release-check") or None, help="Private report directory (default: RELEASE_CHECK_REPORTS or ~/.local/state/release-check)")
+    parser.add_argument("--manifest", type=Path)
     parser.add_argument("--private-repo", action="append", default=[], help="Known-private repo URL or owner/name; kept out of reports")
-    verification_args = parser.add_mutually_exclusive_group()
-    verification_args.add_argument("--verify", action="store_true", help="Execute reviewed quickstart and checks in a fresh clone and venv")
-    verification_args.add_argument("--verify-no-venv", action="store_true", help="For declared stdlib-only projects: fresh clone and HOME, current interpreter (less isolated)")
-    parser.add_argument("--timeout", type=int, default=300, help="Seconds allowed per declared command (default: 300)")
-    parser.add_argument("--scrub-plan", action="store_true", help="Include the scrub-plan document after the legacy JSON summary")
-    parser.add_argument("--json", action="store_true", help="Print the legacy JSON summary instead of readable text")
-    parser.add_argument("--export", type=Path, help="Build a one-commit copy in a new folder outside the source")
-    parser.add_argument("--check-digest", metavar="HEX", help="Check an export against its reported digest without a terms file")
-    args = parser.parse_args(raw_args)
+    parser.add_argument("--verify", action="store_true", help="Execute reviewed manifest quickstart/check argv in a fresh local clone and venv")
+    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--scrub-plan", action="store_true")
+    parser.add_argument("--export", type=Path)
+    args = parser.parse_args(argv)
+    if args.requirements:
+        print(requirements_text(), end="")
+        return 0
+    if args.repo is None:
+        parser.error("pass a repository or --requirements")
+    if not args.denylist:
+        parser.configuration_error("Pass --denylist /private/terms.json or set RELEASE_CHECK_DENYLIST. Pass --reports /private/reports or set RELEASE_CHECK_REPORTS to choose the private report directory; otherwise ~/.local/state/release-check is used.")
+    if not args.reports:
+        parser.configuration_error("Pass --reports /private/reports or set RELEASE_CHECK_REPORTS to a nonempty directory path.")
     os.umask(0o077)
     directory = None
-    owned_export = None
     try:
-        if args.check_digest is not None:
-            if not re.fullmatch(r"[a-fA-F0-9]{64}", args.check_digest):
-                raise AuditError("invalid-digest")
-            repo = args.repo.expanduser().resolve()
-            if not blocked_artifact(repo):
-                validate_repo(repo)
-            try:
-                unchanged = export_digest(repo) == args.check_digest.lower()
-            except AuditError as error:
-                if str(error) != "export-not-clean":
-                    raise
-                unchanged = False
-            record = read_export_audit(repo) if unchanged else None
-            clean = not blocked_artifact(repo) and unchanged and record is not None and record["verdict"] == "PASS" and record["blocking_count"] == 0 and record["verified"]
-            verdict = "PASS" if clean else "FIX-THESE"
-            if clean:
-                text = "DIGEST MATCHES AND THE EXPORT IS CLEAN: 0 blocking findings (PASS)"
-            elif unchanged and record is not None:
-                text = f"DIGEST MATCHES BUT THE EXPORT WAS NOT CLEAN: {record['blocking_count']} blocking findings (FIX-THESE)"
-            elif unchanged:
-                text = "DIGEST MATCHES BUT THE EXPORT WAS NOT CLEAN: unknown blocking findings (FIX-THESE). No valid recorded audit; export again with --verify."
-            else:
-                text = "The export changed or is not a single clean commit. File contents, modes and modification times are part of the digest, as is Git metadata. Restoring bytes alone may not restore the digest. Export again into a new folder."
-            print(f"release-check {VERSION}\nVERDICT: {verdict}\n{text}")
-            verification_text = "not verified" if unchanged else "not established because the digest does not match"
-            if record and record["verified"]:
-                verification_text = "verified (--verify-no-venv; current interpreter, less isolated)" if record["isolation"].startswith("current-interpreter") else "verified (--verify; fresh " + record["isolation"] + ")"
-            print("Verification: " + verification_text)
-            if clean:
-                print(PASS_LIMITATIONS)
-            return 0 if clean else 1
-        if not args.denylist:
-            raise AuditError("denylist-required")
         repo = args.repo.expanduser().resolve()
-        validate_repo(repo)
         denylist = Path(args.denylist).expanduser().resolve()
         if denylist == repo or repo in denylist.parents:
             raise AuditError("denylist-inside-source")
@@ -1611,13 +1258,6 @@ def main(argv: list[str] | None = None) -> int:
             target = args.export.expanduser().resolve()
             if target == denylist or target in denylist.parents:
                 raise AuditError("export-contains-denylist")
-            blocked = target.with_name(target.name + ".BLOCKED")
-            if any(path.exists() or path.is_symlink() for path in (target, blocked)):
-                raise export_destination_error(target, blocked)
-            if target == repo or repo in target.parents:
-                raise AuditError("export-inside-source")
-            if target in repo.parents:
-                raise AuditError("export-parent-of-source")
         if args.timeout < 1:
             raise AuditError("invalid-timeout")
         # Raw repository names never become report directory names if they contain a term.
@@ -1630,103 +1270,33 @@ def main(argv: list[str] | None = None) -> int:
         directory = root / name / stamp
         directory.mkdir(mode=0o700, parents=True)
         directory.chmod(0o700)
-        run_audit = (lambda *params: audit_with_mode(*params, no_venv=True)) if args.verify_no_venv else audit
-        report = run_audit(repo, terms, manifest, args.private_repo, args.verify or args.verify_no_venv, directory, args.timeout)
-        report["scrub_plan"] = scrub_plan(report, repo, manifest, scanner)
+        report = audit(repo, terms, manifest, args.private_repo, args.verify, directory, args.timeout)
+        if args.scrub_plan:
+            report["scrub_plan"] = scrub_plan(report, repo, manifest, scanner)
         if args.export:
-            requested_target = args.export.expanduser().resolve()
-            target = requested_target.with_name(requested_target.name + ".BLOCKED")
-            if not args.json:
-                print("Export starts in a private *.BLOCKED folder; the requested destination is created only after a clean verdict.")
-            if target.exists() or target.is_symlink():
-                raise export_destination_error(target)
-            owned_export = target
-            copied = copy_tree(repo, target, manifest, scanner)
-            export_report = run_audit(target, terms, manifest_for(target, args.manifest), args.private_repo, args.verify or args.verify_no_venv, directory, args.timeout)
+            target = args.export.expanduser().resolve()
+            copy_tree(repo, target, manifest, scanner)
+            export_report = audit(target, terms, manifest_for(target, args.manifest), args.private_repo, args.verify, directory, args.timeout)
             for finding in scanner.findings:
                 export_report["findings"].append(finding)
                 export_report["counts"][finding["category"]] = export_report["counts"].get(finding["category"], 0) + 1
                 export_report["ready"] = False
-            # Historical attribution must survive the public snapshot, not only current files.
-            for commit in git(repo, "rev-list", "--all", "--reflog").splitlines():
-                for entry in filter(None, git(repo, "ls-tree", "-r", "-z", commit.decode()).split(b"\0")):
-                    metadata, raw_path = entry.split(b"\t", 1)
-                    path = raw_path.decode("utf-8", "surrogateescape")
-                    if protected(path) and not (target / path).is_file():
-                        finding_scanner = Scanner(terms)
-                        finding_scanner.add("export", "license", "historical-attribution-missing", path, value=metadata)
-                        export_report["findings"].extend(finding_scanner.findings)
-                        export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
-                        export_report["ready"] = False
-                    elif protected(path) and any(x in Path(path).name.upper() for x in ("NOTICE", "UPSTREAM")):
-                        oid = metadata.split()[2].decode()
-                        old_raw = git(repo, "cat-file", "blob", oid)
-                        old = re.sub(rb"\s+", b" ", old_raw).strip()
-                        current = re.sub(rb"\s+", b" ", (target / path).read_bytes()).strip()
-                        if any(re.sub(rb"\s+", b" ", line).strip() not in current for line in old_raw.splitlines() if line.strip()):
-                            finding_scanner = Scanner(terms)
-                            finding_scanner.add("export", "license", "historical-attribution-changed", path, value=old)
-                            export_report["findings"].extend(finding_scanner.findings)
-                            export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
-                            export_report["ready"] = False
-            finding_scanner = Scanner(terms)
-            apache_attribution_audit(repo, finding_scanner, target, "export")
-            if finding_scanner.findings:
-                export_report["findings"].extend(finding_scanner.findings)
-                export_report["counts"]["license"] = export_report["counts"].get("license", 0) + len(finding_scanner.findings)
-                export_report["ready"] = False
-            export_report["commit"] = git(target, "rev-parse", "HEAD").strip().decode("ascii")
-            for finding in export_report['findings']:
-                finding['origin'] = 'export'
-            export_report["audit_record"] = record_export_audit(target, export_report)
-            if export_report["ready"]:
-                if requested_target.exists() or requested_target.is_symlink():
-                    raise export_destination_error(requested_target)
-                target.rename(requested_target)
-                target = requested_target
-                owned_export = None
-            else:
-                quarantine_export(target)
-                owned_export = None
-            export_report["folder_suffix"] = "" if export_report["ready"] else ".BLOCKED"
-            export_report["digest"] = export_digest(target)
-            export_report["file_count"] = len(copied["files"])
-            export_report["not_exported"] = {"count": len(copied["not_exported"]), "paths": [scanner.safe_path(p) for p in copied["not_exported"][:50]]}
             report["export"] = export_report
-        classification = classify(report)
-        report["verdict"] = classification["verdict"]
-        report["summary"] = {key: len(classification[key]) for key in ("blocking", "warnings")}
-        report["plan"] = build_plan(report, report["scrub_plan"])
-        report["pre_publish_tests"] = test_list(report, manifest, scanner)
-        report["report"] = name + "/" + stamp + "/report.json"
         write_reports(directory, report)
         summary = {"ready": report["ready"], "counts": report["counts"]}
         if "export" in report:
             summary["export_ready"] = report["export"]["ready"]
             summary["export_counts"] = report["export"]["counts"]
-            if not report["export"]["ready"]:
-                summary["export_warning"] = BLOCKED_EXPORT_WARNING
         # Only the relative report locator is printed (home names stay private).
         summary["report"] = name + "/" + stamp + "/report.json"
-        if args.json:
-            print(json.dumps(summary))
-            if args.scrub_plan:
-                print(json.dumps(report["scrub_plan"], indent=2))
-        else:
-            print(format_text(report), end="")
+        print(json.dumps(summary))
+        if args.scrub_plan:
+            print(json.dumps(report["scrub_plan"], indent=2))
         return 0 if report.get("export", report)["ready"] else 1
-    except (Exception, KeyboardInterrupt) as error:
-        if owned_export is not None and owned_export.is_dir():
-            quarantine_export(owned_export)
-        # The CLI boundary must not expose paths or exception details in a traceback.
-        code = error.args[0] if isinstance(error, AuditError) and len(error.args) == 1 and isinstance(error.args[0], str) and error.args[0] in ERRORS else "audit-incomplete"
-        try:
-            if directory is not None and not (directory / "report.json").exists():
-                write_reports(directory, {"version": VERSION, "verdict": "INCOMPLETE", "ready": False, "counts": {"coverage": 1}, "license": {"status": "unknown"}, "verification": {"status": "incomplete"}, "findings": [{"scope": "audit", "category": "coverage", "kind": "audit-incomplete", "path": "@audit", "line": 0, "fingerprint": fingerprint(b"audit-incomplete"), "reviewed": False}]})
-        except Exception:
-            # A failed report write must not bypass the private error response.
-            pass
-        print_error(code, args.json, error.detail if isinstance(error, AuditError) and code != "audit-incomplete" else None)
+    except (AuditError, OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError, subprocess.SubprocessError):
+        if directory is not None and not (directory / "report.json").exists():
+            write_reports(directory, {"version": VERSION, "ready": False, "counts": {"coverage": 1}, "license": {"status": "unknown"}, "verification": {"status": "incomplete"}, "findings": [{"scope": "audit", "category": "coverage", "kind": "audit-incomplete", "path": "@audit", "line": 0, "fingerprint": fingerprint(b"audit-incomplete"), "reviewed": False}]})
+        print('{"ready":false,"error":"audit-incomplete"}', file=sys.stderr)
         return 2
 
 
