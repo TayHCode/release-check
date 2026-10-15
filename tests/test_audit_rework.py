@@ -313,7 +313,7 @@ class ReworkTests(unittest.TestCase):
                  (genuine('BSD-3-Clause'), ['BSD License']), ('LGPL v3', ['GNU Library or Lesser General Public License (LGPL)']),
                  ('Expat (MIT/X11)', ['MIT License'])]
         for label, endings in cases:
-            # Full multiline free text is represented directly after collection.
+
             raw = self.installed(label=label.splitlines()[0], classifiers=['License :: OSI Approved :: ' + c for c in endings])
             package = json.loads(raw)[0]
             package['license'] = label
@@ -463,7 +463,7 @@ class ReworkTests(unittest.TestCase):
             self.assertIn('Retry Debian/Ubuntu', text)
 
     def test_adversarial_metadata_source_combinations(self):
-        # All conflicting-source shapes named by the audit, including malformed duplicates.
+
         cases = [({'expression': 'MIT', 'label': 'GPL-3.0-only'}, 1),
                  ({'label': 'MIT', 'content': GPL}, 1),
                  ({'expression': 'MIT', 'content': 'GNU AFFERO GENERAL PUBLIC LICENSE', 'filename': 'COPYING'}, 1),

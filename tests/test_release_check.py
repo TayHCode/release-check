@@ -387,7 +387,7 @@ class AuditTests(unittest.TestCase):
             rc.quality_audit(self.repo, scanner, self.manifest)
             self.assertFalse(any(f["kind"] == "missing-limitations" for f in scanner.findings))
             self.assertIn(heading, text)
-        # A shared-rule change must change both the listing and the checks.
+
         with patch.object(rc, "REQUIRED_DOCUMENTS", ("EXTRA.md",)), patch.object(rc, "README_HEADINGS", ("changed heading",)), patch.object(rc, "ISSUE_TEMPLATE_GLOBS", ("*.changed",)), patch.object(rc, "TEST_GLOB", "changed*.py"), patch.object(rc, "ROOT_LICENSE_FILES", ("CHANGED-LICENSE",)):
             changed = rc.requirements_text()
             scanner = rc.Scanner(self.terms)
