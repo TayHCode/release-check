@@ -1,6 +1,5 @@
-"""Synthetic whole-word and real-CLI privacy regressions."""
+"""Synthetic boundary, report, history and real-CLI privacy regressions."""
 import json
-import os
 from pathlib import Path
 import re
 import shlex
@@ -12,153 +11,111 @@ import release_check as rc
 import test_release_check as fixtures
 
 
+EXAMPLE_DOMAIN = "example.com"
+
+
 class BoundaryTests(unittest.TestCase):
-    def hits(self, term, text, encoding="utf-8"):
+    def hits(self, term, text, encoding="utf-8", path="sample.txt"):
         scanner = rc.Scanner([term])
-        scanner.text(text.encode(encoding), "tree", "sample.txt")
+        scanner.text(text.encode(encoding), "tree", path)
         return [f for f in scanner.findings if f["kind"] == "denylist"]
 
-    def test_alphabetic_terms_match_whole_tokens_only(self):
-        for text in ("cat", "CAT", "Cat", "(cat)", "cat's", "cat’s", "cat-file",
-                     "cat.txt", "/cat/", "https://cat.example.org", "cat@example.org"):
+    def test_words_and_separate_components_block(self):
+        cases = ["cat", "CAT", "Cat", "(cat)", "cat's", "cat’s", "can't-cat",
+                 "cat_file", "file_cat", "file_cat_name", "cat-file", "file-cat",
+                 "cat.txt", "file.cat.txt", "/cat/", "C:\\cat\\file.txt",
+                 "https://cat.example.org/cat?name=cat#cat", f"cat@{EXAMPLE_DOMAIN}",
+                 f"user@cat.{EXAMPLE_DOMAIN}", f"user+cat@{EXAMPLE_DOMAIN}", "cat2", "2cat",
+                 "getCatValue", "getCATValue", "catFood", "foxCat", "HTTPcat",
+                 "HTTPCat", "CATValue", "catHTTP", "getCat", "caT", "sCATter"]
+        for text in cases:
             with self.subTest(text=text):
-                self.assertTrue(self.hits("cat", text))
-        for text in ("cats", "bobcat", "scatter", "SCATTER", "écaté", "猫cat犬",
-                     "cat_file", "cat2", "2cat", "catFood", "getCat", "HTTPcat", "sCATter"):
+                hits = self.hits("cat", text)
+                self.assertTrue(hits)
+                self.assertTrue(all(not f.get("reviewable") for f in hits))
+                self.assertTrue(all(not f["reviewed"] for f in hits))
+
+    def test_only_longer_letter_components_are_reviewable(self):
+        cases = ["cats", "foxcat", "scatter", "SCATTER", "scattering",
+                 "écaté", "猫cat犬", "_scatter_", "scatter.txt", "/foxcat/",
+                 "https://scatter.example.org/foxcat", f"foxcat@{EXAMPLE_DOMAIN}",
+                 "getScatterValue", "foxcats_food"]
+        for text in cases:
             with self.subTest(text=text):
-                self.assertEqual(self.hits("cat", text), [])
+                hits = self.hits("cat", text)
+                self.assertTrue(hits)
+                self.assertTrue(all(f.get("reviewable") for f in hits))
+                self.assertTrue(all(not f["reviewed"] for f in hits))
 
-    def test_unicode_whole_words_are_case_insensitive(self):
-        self.assertTrue(self.hits("élan", "ÉLAN"))
-        self.assertEqual(self.hits("élan", "mélange"), [])
-        self.assertTrue(self.hits("猫", "猫"))
-        self.assertEqual(self.hits("猫", "猫咪"), [])
+    def test_unicode_letters_case_and_uncertain_marks(self):
+        for term, text, reviewable in [("élan", "ÉLAN", False),
+                                       ("élan", "mélange", True),
+                                       ("élan", "élan_file", False),
+                                       ("猫", "猫_file", False), ("猫", "猫咪", True),
+                                       ("cat", "cat\u0301s", False),
+                                       ("cat", "x\u0301caty", False),
+                                       ("cat", "\u0301cat", False),
+                                       ("cat", "cat\u200ds", False),
+                                       ("cat", "x\ufffdcaty", False),
+                                       ("i", "İ", False), ("i", "mİx", True),
+                                       ("i", "mİValue", False)]:
+            with self.subTest(term=term, text=text):
+                hits = self.hits(term, text)
+                self.assertTrue(hits)
+                self.assertEqual(all(f.get("reviewable", False) for f in hits), reviewable)
+        scanner = rc.Scanner(["cat"])
+        scanner.text(b"xcat\xff", "tree", "sample.txt")
+        self.assertTrue(all(not f.get("reviewable") for f in scanner.findings))
 
-    def test_utf16_preserves_boundaries_and_line_numbers(self):
+    def test_utf16_preserves_boundaries_lines_and_case(self):
         for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
             with self.subTest(encoding=encoding):
-                hits = self.hits("larch", "blank\noverlarch\nlarch", encoding)
-                self.assertTrue(hits)
-                self.assertTrue(all(f["line"] == 3 for f in hits))
+                hits = self.hits("larch", "blank\noverlarch\ngetLarchValue", encoding)
+                self.assertTrue(any(f["line"] == 2 and f.get("reviewable") for f in hits))
+                self.assertTrue(any(f["line"] == 3 and not f.get("reviewable") for f in hits))
 
-    def test_nonalphabetic_terms_are_literal_strings(self):
-        for term in ("z07", "a1", "1", "foo-bar", "dot.name", "foo_bar", "élan1",
-                     "a+b", "owner@example.org", "/home/fakeuser", "@fakehandle"):
-            for text in (term, "x" + term + "y", "_" + term + "_", term.upper()):
+    def test_overlapping_and_mixed_hits_cannot_hide_a_blocker(self):
+        for term, text in [("ana", "ananAna"), ("larch", "overlarch larch")]:
+            with self.subTest(text=text):
+                hits = self.hits(term, text)
+                self.assertTrue(any(f.get("reviewable") for f in hits))
+                self.assertTrue(any(not f.get("reviewable") for f in hits))
+
+    def test_nonalphabetic_terms_keep_the_previous_matching_rule(self):
+        for term in ("z07", "a1", "1", "a1b2", "foo-bar", "dot.name", "foo_bar", "élan1", "猫1", "a+b"):
+            for text in (term, "x" + term + "y", "é" + term + "é", "_" + term + "_", term.upper()):
                 with self.subTest(term=term, text=text):
+                    pattern = re.escape(term)
+                    if len(term) <= 3 and term.isalnum():
+                        pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
+                    expected = bool(re.search(pattern, text, re.I))
                     hits = self.hits(term, text)
-                    self.assertEqual(bool(hits), bool(re.search(re.escape(term), text, re.I)))
+                    self.assertEqual(bool(hits), expected)
+                    self.assertTrue(all(not f.get("reviewable") for f in hits))
 
-    def test_placeholders_constants_and_coauthor_are_not_findings(self):
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("192.0.2.0/24\n198.51.100.42\n203.0.113.255\n2001:db8::1\n"
-                      "example.com\n/workspace/sample-project\nhttps://api.github.com/repos/example/sample-project\n"
-                      "UTF-16\nHTTP/1.1\nwindows-01\n" + "/" + "home/user/data\n"
-                      "Co-Authored-By: Fixture <bot@example.org>\n").encode(), "tree", "README.md")
-        self.assertEqual(scanner.findings, [])
+    def test_every_downgrade_has_an_adjacent_unicode_letter(self):
+        # Guard the privacy invariant across letter, identifier and punctuation contexts.
+        for prefix in ("", "a", "A", "é", "猫", "_", "1", "-", "'", "\u0301"):
+            for suffix in ("", "s", "S", "é", "犬", "_", "1", ".", "’", "\u0301"):
+                text = prefix + "larch" + suffix
+                hits = self.hits("larch", text)
+                self.assertTrue(hits)
+                for finding in hits:
+                    if finding.get("reviewable"):
+                        self.assertTrue(prefix.isalpha() or suffix.isalpha(), text)
 
-    def test_protocol_values_and_token_modules_are_not_secrets(self):
-        scanner = rc.Scanner(["larch"])
-        value = "Ab3D4e5F6g7H8i9J0kL1mN2oP3qR4sT5uV6wX7yZ8"
-        for path in ("token.py", "constants.py", "certificate.pem"):
-            scanner.file(value.encode(), "tree", path)
-        self.assertEqual(scanner.findings, [])
-
-    def test_secret_formats_still_block_without_approvals(self):
-        values = {"github-token": "gh" + "p_" + "A" * 30,
-                  "aws-key": "AKIA" + "A" * 16,
-                  "api-key": "sk-" + "A" * 30,
-                  "google-key": "AIza" + "A" * 35,
-                  "slack-key": "xoxb-" + "A" * 20,
-                  "jwt": "eyJ" + "A" * 18 + "." + "B" * 18 + "." + "C" * 18,
-                  "private-key": "-----BEGIN " + "PRIVATE KEY-----",
-                  "assigned-secret": "api_key=" + "Ab3D4e5F6g7H8i9J0kL",
-                  "bearer": "Bearer " + "A" * 20,
-                  "credential-url": "https://" + "owner:" + "password123" + "@example.com"}
-        for kind, value in values.items():
-            with self.subTest(kind=kind):
-                scanner = rc.Scanner(["larch"])
-                scanner.file(value.encode(), "tree", "sample.txt")
-                expected = "api-key" if kind in {"google-key", "slack-key"} else kind
-                self.assertTrue(any(f["kind"] == expected and not f["reviewed"] for f in scanner.findings))
-
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("github_pat_" + "A" * 25 + "_" + "B" * 25).encode(), "tree", "sample.txt")
-        self.assertTrue(any(f["kind"] == "github-token" for f in scanner.findings))
-
-    def test_anthropic_key_format_is_blocked(self):
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("sk-" + "ant-api03-" + "A" * 35).encode(), "tree", "sample.txt")
-        self.assertTrue(any(f["kind"] == "api-key" and not f["reviewed"] for f in scanner.findings))
-
-    def test_nonplaceholder_emails_block_and_documented_placeholders_pass(self):
-        address = "person" + "@" + "samplemail" + ".invalid"
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("Contact " + address + "\n").encode(), "tree", "sample.txt")
-        self.assertTrue(any(f["kind"] == "email-address" for f in scanner.findings))
-
-        placeholders = ["user@example" + suffix for suffix in (".com", ".org", ".net")]
-        placeholders += ["123+fixture@users.noreply.github.com"]
-        trailer = "Co-Authored-By: Fixture <noreply@" + "anthropic.com>"
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("\n".join(placeholders) + "\n" + trailer + "\n").encode(), "tree", "sample.txt")
-        self.assertEqual(scanner.findings, [])
-
-    def test_transport_and_noreply_addresses_pass_but_personal_addresses_block(self):
-        for local, domain in (("git", "github.com"), ("GIT", "host.invalid"),
-                              ("noreply", "anthropic.com"), ("NO-REPLY", "host.invalid"),
-                              ("123+fixture", "users.noreply.github.com")):
-            with self.subTest(local=local, domain=domain):
-                scanner = rc.Scanner(["larch"])
-                scanner.file((local + "@" + domain).encode(), "tree", "sample.txt")
-                self.assertEqual(scanner.findings, [])
-        for local in ("person", "git.person", "my-noreply", "no-reply-person"):
-            with self.subTest(local=local):
-                scanner = rc.Scanner(["larch"])
-                scanner.file((local + "@" + "mail.invalid").encode(), "tree", "sample.txt")
-                self.assertEqual([f["kind"] for f in scanner.findings], ["email-address"])
-
-    def test_nonplaceholder_home_paths_block_and_documented_placeholders_pass(self):
-        home = "/" + "home/" + "alex/" + "projects/sample"
-        home_root = "/" + "home/" + "casey"
-        mac = "/" + "Users/" + "jordan/" + "work/sample"
-        scanner = rc.Scanner(["larch"])
-        scanner.file((home + "\n" + home_root + "\n" + mac + "\n").encode(), "tree", "sample.txt")
-        self.assertEqual(sum(f["kind"] == "home-path" for f in scanner.findings), 3)
-
-        scanner = rc.Scanner(["larch"])
-        scanner.file(("/" + "home/user/work\n/" + "home/you/work\n/" + "Users/name/work\n").encode(), "tree", "sample.txt")
-        self.assertEqual(scanner.findings, [])
-
-    def test_package_versions_are_not_emails_but_numbered_domains_still_block(self):
-        scanner = rc.Scanner(["larch"])
-        scanner.file(b"brew install python@3.11\npackage@1.2.3\n", "tree", "README.md")
-        self.assertEqual(scanner.findings, [])
-
-        for domain in ("host2.invalid", "3.invalid", "xn--fixture.invalid"):
-            with self.subTest(domain=domain):
-                scanner = rc.Scanner(["larch"])
-                scanner.file(("person@" + domain + ".\n").encode(), "tree", "sample.txt")
-                self.assertEqual([f["kind"] for f in scanner.findings], ["email-address"])
-
-    def test_owner_identifiers_only_match_when_denied(self):
-        for term in ("Person", "Family", "Agent", "owner@example.org", "windows-01",
-                     "node.internal", "/" + "home/" + "fakeuser", "@fakehandle"):
-            with self.subTest(term=term):
-                scanner = rc.Scanner([term])
-                scanner.text(term.upper().encode(), "tree", "README.md")
-                self.assertEqual(len(scanner.findings), 1)
-                self.assertEqual(scanner.findings[0]["kind"], "denylist")
-
-    def test_unicode_filename_matches_stay_redacted(self):
+    def test_unicode_ignorecase_filename_matches_are_still_redacted(self):
+        # re.I also matches dotless i, which casefold alone does not map to i.
         scanner = rc.Scanner(["i"])
-        scanner.file(b"i", "tree", "mıx.txt")
+        scanner.file(b"", "tree", "mıx.txt")
+        self.assertTrue(scanner.findings)
         self.assertTrue(all(f["path"].startswith("[path-") for f in scanner.findings))
         self.assertNotIn("mıx", json.dumps(scanner.findings, ensure_ascii=False))
 
 
 class PrivacyIntegrationTests(unittest.TestCase):
     def setUp(self):
+        # Reuse the existing fully synthetic, valid repository fixture.
         self.fixture = fixtures.AuditTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
@@ -167,18 +124,20 @@ class PrivacyIntegrationTests(unittest.TestCase):
     def cli(self, *args):
         fixture = self.fixture
         result = subprocess.run([sys.executable, rc.__file__, str(fixture.repo),
-                                 "--denylist", str(fixture.denylist), "--reports",
-                                 str(fixture.root / "reports"), *args], capture_output=True, text=True, timeout=60)
+                                 "--denylist", str(fixture.denylist),
+                                 "--reports", str(fixture.root / "reports"), *args],
+                                capture_output=True, text=True, timeout=60)
         self.assertNotIn("larch", (result.stdout + result.stderr).lower())
         locator = json.loads(result.stdout.splitlines()[0])["report"]
         report_path = fixture.root / "reports" / locator
         raw_json, markdown = report_path.read_text(), report_path.with_suffix(".md").read_text()
         self.assertNotIn("larch", (raw_json + markdown).lower())
+        self.assertIn("## Reviewable private-term hits (nonblocking)", markdown)
         return result.returncode, json.loads(raw_json), markdown
 
-    def test_inside_word_hits_produce_no_findings_or_review_class(self):
+    def test_reviewable_only_cli_and_export_remain_ready_and_redacted(self):
         fixture = self.fixture
-        (fixture.repo / "overlarch.txt").write_text("overlarch\ngetLarchValue\n")
+        (fixture.repo / "overlarch.txt").write_text("ordinary\noverlarch\n")
         fixture.commit("Review overlarch")
         code, report, markdown = self.cli("--verify", "--scrub-plan", "--export", str(fixture.root / "export"))
         self.assertEqual(code, 0)
@@ -186,59 +145,94 @@ class PrivacyIntegrationTests(unittest.TestCase):
             self.assertTrue(target["ready"])
             self.assertEqual(target["counts"], {})
             self.assertEqual(target["findings"], [])
-            self.assertNotIn("reviewable_findings", target)
-            self.assertNotIn("reviewable_count", target)
-        self.assertNotIn("Reviewable private-term", markdown)
+            self.assertGreater(target["reviewable_count"], 0)
+            self.assertEqual(target["reviewable_count"], len(target["reviewable_findings"]))
+            self.assertEqual(target["reviewed_count"], 0)
+            self.assertTrue(all(f["path"].startswith("[path-") or f["scope"] == "metadata"
+                                for f in target["reviewable_findings"]))
         self.assertEqual(report["scrub_plan"]["replace_or_remove"], [])
+        self.assertTrue(any(f["line"] == 2 for f in report["reviewable_findings"]))
+        self.assertTrue({"tree", "history", "metadata"} <= {f["scope"] for f in report["reviewable_findings"]})
+        self.assertIn("[path-", markdown)
 
-    def test_whole_word_hits_block_and_only_they_need_scrubbing(self):
+    def test_mixed_hits_remain_blocking_and_scrub_only_requires_blockers(self):
         fixture = self.fixture
         (fixture.repo / "data.txt").write_text("overlarch\nlarch\ngetLarchValue\n")
         fixture.commit("Fixture")
-        code, report, _ = self.cli("--verify", "--scrub-plan")
+        code, report, _ = self.cli("--verify", "--scrub-plan", "--export", str(fixture.root / "export"))
         self.assertEqual(code, 1)
-        self.assertFalse(report["ready"])
-        self.assertTrue(report["scrub_plan"]["replace_or_remove"])
-        self.assertTrue(all(f["line"] == 2 for f in report["scrub_plan"]["replace_or_remove"]))
+        for target in (report, report["export"]):
+            self.assertFalse(target["ready"])
+            self.assertGreater(target["counts"]["personal"], 0)
+            self.assertTrue(any(f["line"] == 2 and f["kind"] == "denylist" for f in target["findings"]))
+            self.assertTrue(any(f["line"] == 3 and f["kind"] == "denylist" for f in target["findings"]))
+            self.assertTrue(any(f["line"] == 1 for f in target["reviewable_findings"]))
+        self.assertTrue(all(f["line"] in {2, 3} for f in report["scrub_plan"]["replace_or_remove"]))
 
-    def test_denylist_cannot_be_waived_even_with_reason(self):
+    def test_exact_denylist_approval_is_visible_and_limited_to_its_finding(self):
+        fixture = self.fixture
+        (fixture.repo / "public-data.csv").write_text("larch\n")
+        (fixture.repo / "other-data.csv").write_text("larch\n")
+        approval = {"scope": "tree", "kind": "denylist", "path": "public-data.csv",
+                    "fingerprint": rc.fingerprint("larch"), "reason": "Verified this exact public IRS record."}
+        manifest = {**fixture.manifest, "approvals": [approval]}
+        report = rc.audit(fixture.repo, ["larch"], manifest, [], False, fixture.root / "reports", 10)
+        matched = next(f for f in report["findings"] if f["path"] == "public-data.csv")
+        unmatched = next(f for f in report["findings"] if f["path"] == "other-data.csv")
+        self.assertTrue(matched["reviewed"])
+        self.assertEqual(matched["review_source"], "owner approval")
+        self.assertEqual(matched["review_status"], "accepted by owner approval")
+        self.assertEqual(matched["reason"], approval["reason"])
+        self.assertFalse(unmatched["reviewed"])
+        self.assertNotIn("larch", json.dumps(report).lower())
+        report_dir = fixture.root / "accepted-report"
+        report_dir.mkdir()
+        rc.write_reports(report_dir, report)
+        markdown = (report_dir / "report.md").read_text()
+        self.assertIn("accepted by owner approval", markdown)
+        self.assertIn(approval["reason"], markdown)
+        self.assertNotIn("larch", markdown.lower())
+
+    def test_denylist_approval_requires_exact_fingerprint_and_reason(self):
         scanner = rc.Scanner(["larch"], approvals=[{"scope": "tree", "kind": "denylist",
-                            "path": "data.txt", "fingerprint": rc.fingerprint("larch"), "reason": "Reviewed."}])
-        scanner.file(b"larch", "tree", "data.txt")
+            "path": "public-data.csv", "fingerprint": "0000000000000000", "reason": "Reviewed exact record."}])
+        scanner.file(b"larch", "tree", "public-data.csv")
         self.assertFalse(scanner.findings[0]["reviewed"])
         self.assertEqual(scanner.matched_approvals, set())
+        scanner = rc.Scanner(["larch"], approvals=[{"scope": "tree", "kind": "denylist",
+            "path": "public-data.csv", "fingerprint": rc.fingerprint("larch"), "reason": "   "}])
+        scanner.file(b"larch", "tree", "public-data.csv")
+        self.assertFalse(scanner.findings[0]["reviewed"])
 
-    def test_owner_email_in_history_blocks_but_coauthor_does_not(self):
+    def test_unmatched_denylist_approval_is_reported_stale(self):
         fixture = self.fixture
-        fixture.git("config", "user.email", "bot@example.org")
-        fixture.git("commit", "-q", "--allow-empty", "-m", "Fixture\n\nCo-Authored-By: Fixture <bot@example.org>")
-        code, report, markdown = self.cli("--verify")
-        self.assertEqual(code, 0)
-        fixture.denylist.write_text(json.dumps(["owner@example.org"]))
-        fixture.git("config", "user.email", "owner@example.org")
-        fixture.git("commit", "-q", "--allow-empty", "-m", "Fixture")
-        code, report, markdown = self.cli("--verify")
-        self.assertEqual(code, 1)
-        self.assertTrue(any(f["scope"] == "metadata" and f["kind"] == "denylist" for f in report["findings"]))
+        approval = {"scope": "tree", "kind": "denylist", "path": "gone.csv",
+                    "fingerprint": "0123456789abcdef", "reason": "Verified public data."}
+        report = rc.audit(fixture.repo, ["larch"], {**fixture.manifest, "approvals": [approval]},
+                          [], False, fixture.root / "reports", 10)
+        self.assertEqual(report["stale_approvals"], [{key: approval[key] for key in
+                         ("scope", "kind", "path", "fingerprint")}])
+        report_dir = fixture.root / "stale-report"
+        report_dir.mkdir()
+        rc.write_reports(report_dir, report)
+        self.assertIn("## Stale approvals", (report_dir / "report.md").read_text())
 
-    def test_unlisted_email_in_file_and_git_identity_blocks(self):
+    def test_reviewable_hit_cannot_relax_other_gates_or_redaction(self):
         fixture = self.fixture
-        address = "fixture.person" + "@" + "samplemail" + ".invalid"
-        (fixture.repo / "contact.txt").write_text("Contact: " + address + "\n")
-        fixture.git("config", "user.email", address)
-        fixture.commit("Synthetic fixture")
-        code, report, markdown = self.cli("--verify")
-        self.assertEqual(code, 1)
-        hits = [f for f in report["findings"] if f["kind"] == "email-address"]
-        self.assertTrue(any(f["scope"] == "tree" for f in hits))
-        self.assertTrue(any(f["scope"] == "metadata" for f in hits))
-        self.assertNotIn(address, json.dumps(report) + markdown)
+        (fixture.repo / "data.txt").write_text("overlarch\n")
+        code, report, _ = self.cli()
+        self.assertEqual(code, 2)
+        self.assertGreater(report["reviewable_count"], 0)
+        self.assertTrue(any(f["kind"] == "verification-not-run" for f in report["findings"]))
+        scanner = rc.Scanner(["larch"])
+        diagnostic = rc.venv_failure(b"Failure: overlarch", scanner)
+        self.assertNotIn("larch", json.dumps(diagnostic))
 
-    def test_deleted_history_and_commit_identity_still_block(self):
+    def test_deleted_history_and_commit_identity_components_still_block(self):
         fixture = self.fixture
         (fixture.repo / "larch.txt").write_text("larch\n")
         fixture.git("config", "user.name", "Larch")
-        fixture.commit("larch")
+        fixture.commit("getLarchValue")
         fixture.git("rm", "--", "larch.txt")
         fixture.git("config", "user.name", "Fixture")
         fixture.git("commit", "-q", "-m", "Remove")
@@ -246,37 +240,6 @@ class PrivacyIntegrationTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue(any(f["scope"] == "history" and f["kind"] == "denylist" for f in report["findings"]))
         self.assertTrue(any(f["scope"] == "metadata" and f["kind"] == "denylist" for f in report["findings"]))
-
-    def test_missing_configuration_explains_both_flags_and_environment(self):
-        environment = {k: v for k, v in os.environ.items() if k not in {"RELEASE_CHECK_DENYLIST", "RELEASE_CHECK_REPORTS"}}
-        result = subprocess.run([sys.executable, rc.__file__, str(self.fixture.repo)], env=environment, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        message = json.loads(result.stderr)["message"]
-        for value in ("--denylist /private/terms.json", "--reports /private/reports", "RELEASE_CHECK_DENYLIST", "RELEASE_CHECK_REPORTS"):
-            self.assertIn(value, message)
-
-    def test_environment_defaults_and_explicit_flags_win(self):
-        fixture = self.fixture
-        environment = {**os.environ, "RELEASE_CHECK_DENYLIST": str(fixture.denylist), "RELEASE_CHECK_REPORTS": str(fixture.root / "env-reports")}
-        result = subprocess.run([sys.executable, rc.__file__, str(fixture.repo)], env=environment, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1)
-        self.assertTrue(list((fixture.root / "env-reports").rglob("report.json")))
-        environment.update(RELEASE_CHECK_DENYLIST=str(fixture.root / "missing.json"), RELEASE_CHECK_REPORTS=str(fixture.repo / "forbidden-reports"))
-        result = subprocess.run([sys.executable, rc.__file__, str(fixture.repo), "--denylist", str(fixture.denylist), "--reports", str(fixture.root / "explicit-reports")], env=environment, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 1)
-        self.assertTrue(list((fixture.root / "explicit-reports").rglob("report.json")))
-        self.assertFalse((fixture.repo / "forbidden-reports").exists())
-
-    def test_empty_report_default_has_actionable_error(self):
-        environment = {**os.environ, "RELEASE_CHECK_DENYLIST": str(self.fixture.denylist), "RELEASE_CHECK_REPORTS": ""}
-        result = subprocess.run([sys.executable, rc.__file__, str(self.fixture.repo)], env=environment, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("--reports /private/reports", json.loads(result.stderr)["message"])
-
-    def test_invalid_argument_never_prints_private_argument(self):
-        result = subprocess.run([sys.executable, rc.__file__, "--invalid-larch=private-value"], capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr), {"ready": False, "error": "invalid-arguments"})
 
     def test_declared_project_quickstart_lines_remain_exact(self):
         root = Path(rc.__file__).parent

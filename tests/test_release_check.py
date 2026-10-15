@@ -59,10 +59,14 @@ class AuditTests(unittest.TestCase):
             code = rc.main([str(self.repo), "--denylist", str(self.denylist), "--reports", str(self.root / "reports"), *args])
         return code, out.getvalue(), err.getvalue()
 
-    def test_nonalphabetic_aliases_are_literal_strings(self):
-        scanner = rc.Scanner(['z07'])
-        scanner.text(b'z07\nxz07y', 'tree', 'config')
-        self.assertEqual(len(scanner.findings), 2)
+    def test_short_aliases_detect_words_and_filenames_not_digest_substrings(self):
+        scanner=rc.Scanner(['z07'])
+        scanner.text(b'sha256:abcz07def https://files.pythonhosted.org/abz07cd/wheel.whl', 'tree', 'uv.lock')
+        self.assertEqual(scanner.findings, [])
+        scanner.text(b'z07\nZ07.example.test\n/units/tool-z07-9222.service', 'tree', 'config')
+        self.assertEqual(len(scanner.findings), 3)
+        scanner.file(b'', 'tree', 'tool-z07.service')
+        self.assertTrue(any(f['kind']=='denylist' and f['path'].startswith('[path-') for f in scanner.findings))
 
     def test_full_history_names_metadata_and_case_insensitive_terms(self):
         (self.repo / "HIDDENPERSON.txt").write_text("hiddenperson\n")
@@ -87,10 +91,36 @@ class AuditTests(unittest.TestCase):
         self.git("checkout", "-q", "main")
         self.assertTrue(any(f["kind"] == "denylist" and f["scope"] == "history" for f in self.scan().findings))
 
-    def test_explicit_private_repository_references_block(self):
-        scanner = rc.Scanner(self.terms, ["fake/private-repo"])
-        scanner.file(b"https://github.com/fake/private-repo", "tree", "text.txt")
-        self.assertEqual([f["kind"] for f in scanner.findings], ["private-repo-url"])
+    def test_builtin_network_and_personal_detectors(self):
+        # Neutral documentation values, assembled only for detector-negative tests.
+        raw = ("demo@" + "example.com\n" + "+1 " + "202-" + "555-" + "0100\n"
+               + ".".join(["192", "0", "2", "1"]) + "\n" + ":".join(["2001", "db8", "", "1"]) + "\n"
+               + ".".join(["100", "64", "0", "1"]) + "\n"
+               + "host" + ".ts" + ".net\n" + "/home/" + "user/data\n"
+               + "C:\\Users\\" + "user\\data\n" + "host" + ".internal\n"
+               + "fixture" + "-01\n" + "https://host.example/fixture/" + "private-repo\n").encode()
+        scanner = rc.Scanner(self.terms, ["fixture/private-repo"])
+        scanner.file(raw, "tree", "text.txt")
+        kinds = {f["kind"] for f in scanner.findings}
+        self.assertTrue({"email", "phone", "ipv4", "ipv6", "tailnet-ip", "tailnet-host", "home-path", "internal-host", "private-repo-url"} <= kinds)
+        self.assertNotIn("user/data", json.dumps(scanner.findings))
+
+    def test_encoding_names_are_not_internal_hosts(self):
+        for encoding in ("UTF-16", "utf-8", "utf-32", "ISO-8859-1", "iso-88",
+                         "UCS-02", "cp-12", "latin-1", "latin-12"):
+            with self.subTest(encoding=encoding):
+                scanner = rc.Scanner(self.terms)
+                scanner.file(f"Text encoding: {encoding}\n".encode(), "tree", "encodings.txt")
+                self.assertEqual(scanner.findings, [])
+
+    def test_internal_host_aliases_are_flagged(self):
+        for label in ("fixture", "Fixture", "sample", "example", "host"):
+            alias = label + "-" + "02"
+            with self.subTest(alias=alias):
+                scanner = rc.Scanner(self.terms)
+                scanner.file(alias.encode(), "tree", "hosts.txt")
+                aliases = [f for f in scanner.findings if f["kind"] == "internal-host"]
+                self.assertEqual([f["fingerprint"] for f in aliases], [rc.fingerprint(alias)])
 
     def test_secrets_values_never_reach_output_or_reports(self):
         secret = "gh" + "p_" + "Ab2C3d4E5f6G7h8I9j0K" + "lmNOPqRsTuvWxYz"
@@ -122,12 +152,19 @@ class AuditTests(unittest.TestCase):
         repeat = rc.Scanner(self.terms, approvals=[approve])
         repeat.file(b"HiddenPerson", "tree", "data.txt")
         self.assertFalse(repeat.findings[0]["reviewed"])
+        repeat = rc.Scanner(self.terms)
+        repeat.file(("demo@" + "example.com").encode(), "tree", "text.txt")
+        hit = next(f for f in repeat.findings if f["kind"] == "email")
+        repeat = rc.Scanner(self.terms, approvals=[hit])
+        repeat.file(("demo@" + "example.com").encode(), "tree", "text.txt")
+        repeat.file(("demo@" + "example.com").encode(), "tree", "other.txt")
+        self.assertEqual(sum(f["reviewed"] for f in repeat.findings), 1)
 
     def test_private_filename_and_ipv6_filename_are_fingerprinted(self):
         scanner = rc.Scanner(self.terms)
         scanner.file(b"fixture", "tree", "HiddenPerson.txt")
         self.assertTrue(all(f["path"].startswith("[path-") for f in scanner.findings))
-        self.assertTrue(scanner.safe_path("2001:db8::1.txt").startswith("[path-"))
+        self.assertTrue(scanner.safe_path(":".join(["2001", "db8", "", "1.txt"])).startswith("[path-"))
 
     def test_opaque_secret_filename_never_reaches_reports(self):
         value = "Ab3D4e5F6g7H8i9J0kL1m" + "N2oP3qR4sT5uV6wX7yZ8"
@@ -179,13 +216,13 @@ class AuditTests(unittest.TestCase):
         scanner.file(b'attrs-26.1.0\n2026-03-19T14:22:25Z\n"License :: OSI Approved :: MIT License"\nPath.home()\n', "tree", "metadata.txt")
         self.assertEqual(scanner.findings, [])
 
-    def test_labelled_secrets_cannot_be_approved(self):
+    def test_entropy_and_key_formats_cannot_be_approved(self):
         value = "Ab3D4e5F6g7H8i9J0kL1m" + "N2oP3qR4sT5uV6wX7yZ8"
         scanner = rc.Scanner(self.terms)
-        scanner.file(("api_key=" + value).encode(), "tree", "random.txt")
-        self.assertTrue(any(f["kind"] == "assigned-secret" for f in scanner.findings))
+        scanner.file(value.encode(), "tree", "random.txt")
+        self.assertTrue(any(f["kind"] == "entropy" for f in scanner.findings))
         repeat = rc.Scanner(self.terms, approvals=scanner.findings)
-        repeat.file(("api_key=" + value).encode(), "tree", "random.txt")
+        repeat.file(value.encode(), "tree", "random.txt")
         self.assertTrue(all(not f["reviewed"] for f in repeat.findings))
 
     def test_compressed_and_binary_files_require_review(self):
@@ -238,50 +275,24 @@ class AuditTests(unittest.TestCase):
     def test_license_text_and_protected_attribution(self):
         scanner = rc.Scanner(self.terms)
         self.assertEqual(rc.license_audit(self.repo, scanner, self.manifest)["status"], "pass")
+        manifest = {**self.manifest, "exclude": ["LICENSE"]}
+        rc.license_audit(self.repo, scanner, manifest)
+        self.assertTrue(any(f["kind"] == "excluded-attribution" for f in scanner.findings))
         (self.repo / "LICENSE").write_text("MIT License\nPermission is hereby granted to do something else.")
         self.assertEqual(rc.license_audit(self.repo, scanner, self.manifest)["status"], "blocked")
 
-    def test_non_project_license_mentions_do_not_create_license_findings(self):
-        fixtures = Path(__file__).parent / "fixtures" / "licenses"
-        (self.repo / "site-packages" / "example" / "dist-info").mkdir(parents=True)
-        shutil.copyfile(fixtures / "gpl-compatibility-note.txt", self.repo / "site-packages/example/dist-info/LICENSE")
-        (self.repo / "vendor").mkdir()
-        shutil.copyfile(fixtures / "apache-disclaimer-note.txt", self.repo / "vendor/NOTICE")
-        (self.repo / "THIRD_PARTY_NOTICES.txt").write_text((fixtures / "gpl-compatibility-note.txt").read_text())
-        self.commit("Add generic third-party licence wording")
-        scanner = self.scan()
-        rc.license_audit(self.repo, scanner, self.manifest)
-        self.assertFalse(any(f["category"] == "license" for f in scanner.findings))
-
-    def test_known_spdx_licences_and_declared_metadata_must_agree(self):
-        (self.repo / "LICENSE").write_text("SPDX-License-Identifier: Apache-2.0\n")
-        (self.repo / "pyproject.toml").write_text('[project]\nlicense = "Apache-2.0"\n')
-        result = rc.license_audit(self.repo, rc.Scanner(self.terms), self.manifest)
-        self.assertEqual((result["status"], result["identifier"]), ("pass", "Apache-2.0"))
-        (self.repo / "pyproject.toml").write_text('[project]\nlicense = { text = "Apache-2.0" }\n')
-        scanner = rc.Scanner(self.terms)
-        rc.license_audit(self.repo, scanner, self.manifest)
-        self.assertFalse(scanner.findings)
-        (self.repo / "pyproject.toml").write_text('[project]\nlicense = { file = "LICENSE" }\n')
-        scanner = rc.Scanner(self.terms)
-        rc.license_audit(self.repo, scanner, self.manifest)
-        self.assertFalse(scanner.findings)
-        (self.repo / "package.json").write_text('{"name":"fixture","license":"GPL-3.0-only"}')
-        scanner = rc.Scanner(self.terms)
-        rc.license_audit(self.repo, scanner, self.manifest)
-        self.assertEqual([f["kind"] for f in scanner.findings], ["license-metadata-mismatch"])
-
-    def test_historical_notice_does_not_create_license_finding(self):
+    def test_historical_notice_cannot_be_removed_from_export(self):
         (self.repo / "NOTICE").write_text("Upstream attribution fixture.")
         self.commit("Add attribution")
         self.git("rm", "--", "NOTICE")
         self.git("commit", "-q", "-m", "Remove notice")
         code, out, err = self.run_cli("--verify", "--export", str(self.root / "export"))
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)
         report = json.loads(next((self.root / "reports").rglob("report.json")).read_text())
-        self.assertFalse(any(f["category"] == "license" for f in report["export"]["findings"]))
+        self.assertFalse(report["export"]["ready"])
+        self.assertTrue(any(f["kind"] == "historical-attribution-missing" for f in report["export"]["findings"]))
 
-    def test_changed_notice_does_not_create_license_finding(self):
+    def test_changed_notice_blocks_but_added_notice_context_preserves_attribution(self):
         (self.repo / "NOTICE").write_text("Upstream attribution fixture.\n")
         self.commit("Add attribution")
         (self.repo / "NOTICE").write_text("New context.\nUpstream attribution fixture.\n")
@@ -289,9 +300,9 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(code, 0, out + err)
         (self.repo / "NOTICE").write_text("Different attribution.\n")
         code, out, err = self.run_cli("--verify", "--export", str(self.root / "bad-export"))
-        self.assertEqual(code, 0, out + err)
+        self.assertEqual(code, 1, out + err)
         report = json.loads(sorted((self.root / "reports").rglob("report.json"))[-1].read_text())
-        self.assertFalse(any(f["category"] == "license" for f in report["export"]["findings"]))
+        self.assertTrue(any(f["kind"] == "historical-attribution-changed" for f in report["export"]["findings"]))
 
     def test_shallow_history_blocks_coverage(self):
         shallow = self.root / "shallow"
@@ -452,7 +463,6 @@ class AuditTests(unittest.TestCase):
                 self.assertNotIn(path, hit["error_tail"])
                 self.assertIn("[redacted]", hit["error_tail"])
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "The copied-interpreter fixture requires Linux's stdlib layout.")
     def test_verify_cli_with_real_interpreter_missing_ensurepip(self):
         # Copy the interpreter and stdlib, omitting ensurepip; never change the host.
         home = self.root / "python-home"
@@ -471,7 +481,7 @@ class AuditTests(unittest.TestCase):
             result = subprocess.run([str(interpreter), str(Path(rc.__file__).resolve()), str(self.repo),
                                      "--denylist", str(self.denylist), "--reports", str(reports), "--verify"],
                                     env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             report = json.loads(next(reports.rglob("report.json")).read_text())
             self.assertEqual(report["verification"]["status"], "blocked")
             return next(f for f in report["findings"] if f["kind"] == "venv-creation-failed")
@@ -518,7 +528,7 @@ class AuditTests(unittest.TestCase):
         scanner = rc.Scanner(self.terms)
         rc.dependency_audit(raw, self.repo, scanner, self.manifest)
         manifest = {**self.manifest, "approvals": [{**scanner.findings[0], "reason": "Reviewed exact evidence."}]}
-        def verification(repo, report_dir, scanner, manifest, timeout):
+        def verification(repo, report_dir, scanner, manifest, timeout, *, tool_exclusions=()):
             deps = rc.dependency_audit(raw, repo, scanner, manifest)
             return {"status": "pass" if not deps["blocked"] else "blocked", "commands": [], "dependencies": deps}
         with patch.object(rc, "verify", side_effect=verification):

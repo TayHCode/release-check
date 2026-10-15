@@ -7,6 +7,7 @@ from collections import Counter
 from datetime import datetime, timezone
 import fnmatch
 import hashlib
+import ipaddress
 import inspect
 import json
 import math
@@ -16,13 +17,15 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unicodedata
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
+MAX_RECEIPT_BYTES = 1024 * 1024
 MEDIA = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf", ".mp4", ".mov", ".wav", ".mp3", ".heic"}
 GENERATED = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build"}
 ROOT_LICENSE_FILES = ("LICENSE", "LICENSE.MD", "LICENSE.TXT", "COPYING")
@@ -34,8 +37,23 @@ TEST_DIR, TEST_GLOB = "tests", "test*.py"
 CHECK_ROLES = ("quickstart", "tests", "lint", "types", "build", "syntax")
 CONFIGURED_CHECKS = (("ruff", "lint"), ("mypy", "types"))
 DEPENDENCY_LICENSE_FILE = r"^(?:LICEN[CS]E|COPYING|COPYRIGHT|NOTICE|UNLICENSE).*"
-MANIFEST_KEYS = ("exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses")
+MANIFEST_KEYS = ("exclude", "approvals", "quickstart", "checks", "license", "dependency_licenses", "verify_tools")
 DEFAULT_EXCLUDES = [".git", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "credentials*", "*token.json", ".close_idle_tabs_state.json"]
+INCOMPLETE_KINDS = {
+    "verification-not-run", "verification-not-configured", "verify-tool-missing",
+    "venv-creation-failed", "quickstart-not-declared", "test-command-not-declared",
+    "configured-check-not-declared", "dependency-metadata-failed",
+    "dependency-ecosystem-manual-review", "dynamic-license-or-dependencies",
+    "manual-review",
+}
+PATTERNS = {
+    "email": r"(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}(?![\w.-])",
+    "phone": r"(?<!\w)(?:(?:\+\d{1,3}[ .-])?(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4}|\+\d{8,15})(?!\w)",
+    "home-path": r"(?:/home/[^/\s\"'<>]+|/Users/[^/\s\"'<>]+|[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s\"'<>]+)",
+    "tailnet-host": r"\b[\w.-]+\.ts\.net\b",
+    "internal-host": r"(?<![\w.-])(?:[\w-]+(?:\.[\w-]+)*\.(?:internal|local|lan|corp|home|localdomain)|(?!(?:utf|ucs|iso|cp|latin)-\d{2}(?![\w.-]))[a-z][a-z-]*-\d{2})(?![\w.-]|\()",
+    "private-repo-url": r"(?:https?://|git@)(?:gitlab|github|git|gitea)\.(?:internal|local|lan|corp)[^\s\"'<>]*|https?://[^/\s]+/[^\s\"'<>]*\bprivate\b[^\s\"'<>]*",
+}
 SECRET_PATTERNS = {
     "private-key": r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
     "github-token": r"\b(?:gh[pousr]_[A-Za-z0-9]{20,255}|github_pat_[A-Za-z0-9_]{20,255})\b",
@@ -46,22 +64,6 @@ SECRET_PATTERNS = {
     "assigned-secret": r"(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token)\s*[:=]\s*[\"']?([^\s\"',;\}\]]{8,})",
     "bearer": r"(?i)\bBearer\s+([A-Za-z0-9._~+/-]{16,})",
 }
-# A numeric version suffix (for example, python@3.11) is not an email TLD.
-EMAIL_PATTERN = r"(?i)(?<![\w.+-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)*\.[A-Z](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
-HOME_PATH_PATTERN = r"(?<![A-Za-z0-9._-])/(?:home|Users)/([A-Za-z0-9._-]+)(?=/|(?=$|[\s,;:]))"
-
-
-def placeholder_email(address: str, line: str) -> bool:
-    local, _, domain = address.casefold().rpartition("@")
-    if domain in {"example.com", "example.org", "example.net"} or domain.endswith((".example.com", ".example.org", ".example.net")):
-        return True
-    if domain in {"users.noreply.github.com", "noreply.github.com"}:
-        return True
-    return local in {"git", "noreply", "no-reply"}
-
-
-def placeholder_home(name: str) -> bool:
-    return name.casefold() in {"user", "you", "name"}
 
 
 class AuditError(Exception):
@@ -72,10 +74,6 @@ class PrivateParser(argparse.ArgumentParser):
     def error(self, message):
         # argparse normally includes the offending argument, which may be a secret.
         print('{"ready":false,"error":"invalid-arguments"}', file=sys.stderr)
-        raise SystemExit(2)
-
-    def configuration_error(self, message):
-        print(json.dumps({"ready": False, "error": "missing-configuration", "message": message}), file=sys.stderr)
         raise SystemExit(2)
 
 
@@ -141,6 +139,39 @@ def protected(path: str) -> bool:
     return bool(re.search(r"(?:^|/)(?:LICENSE[^/]*|COPYING[^/]*|NOTICE[^/]*|UPSTREAM[^/]*|THIRD_PARTY[^/]*)$", path, re.I))
 
 
+def inside_letter_component(text: str, start: int, end: int) -> bool:
+    """Downgrade only a substring confined to one longer Unicode letter component.
+
+    Punctuation/digits delimit components. Camel-case transitions also delimit
+    them; crossing a transition or touching an uncertain character stays blocking.
+    Use original case and offsets, never a casefolded copy of the input.
+    """
+    def upper(char):
+        return char.isupper() or unicodedata.category(char) == "Lt"
+
+    def camel_boundary(position):
+        if not 0 < position < len(text):
+            return False
+        previous, current = text[position - 1], text[position]
+        return ((previous.islower() and upper(current))
+                or (upper(previous) and upper(current)
+                    and position + 1 < len(text) and text[position + 1].islower()))
+
+    # Marks can belong to a letter; invisible/undecodable text is also uncertain.
+    if any(unicodedata.category(char).startswith("M")
+           or unicodedata.category(char) in {"Cf", "Cs"} or char == "\ufffd"
+           for char in text[max(0, start - 1):end + 1]):
+        return False
+    if any(camel_boundary(position) for position in range(start + 1, end)):
+        return False
+    # HTTPcat could mean HTTP + cat rather than HTT + Pcat. Never downgrade
+    # a hit at that ambiguous acronym-to-lowercase join.
+    if start >= 2 and upper(text[start - 2]) and upper(text[start - 1]) and text[start].islower():
+        return False
+    return ((start > 0 and text[start - 1].isalpha() and not camel_boundary(start))
+            or (end < len(text) and text[end].isalpha() and not camel_boundary(end)))
+
+
 class Scanner:
     def __init__(self, terms: list[str], private_repos: list[str] = (), approvals: list[dict] = ()):
         self.terms = terms
@@ -157,7 +188,7 @@ class Scanner:
         for term in self.terms:
             if term.casefold() in path.casefold() or re.search(re.escape(term), path, re.I):
                 return "[path-" + fingerprint(original) + "]"
-        for pattern in [*SECRET_PATTERNS.values(), EMAIL_PATTERN, HOME_PATH_PATTERN, r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"]:
+        for pattern in [*PATTERNS.values(), *SECRET_PATTERNS.values(), r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)"]:
             if re.search(pattern, path, re.I):
                 return "[path-" + fingerprint(original) + "]"
         if any(url.casefold() in path.casefold() for url in self.private_repos):
@@ -176,9 +207,10 @@ class Scanner:
             item["object"] = object_id
         # Approvals are specific to kind, path, scope and fingerprint.
         licence_review = category == "license" and kind == "dependency-license-review" and scope == "verification"
-        eligible = category == "media" or licence_review
+        approval_reason = None
+        eligible = category in {"personal", "media"} or licence_review or kind == "denylist"
         approved = False
-        needs_reason = licence_review
+        needs_reason = licence_review or kind == "denylist"
         for approval_index, approval in enumerate(self.approvals):
             exact = all(approval.get(k) == item[k] for k in ("scope", "kind", "path", "fingerprint"))
             reason = approval.get("reason")
@@ -187,7 +219,12 @@ class Scanner:
             if eligible and exact and valid_reason:
                 self.matched_approvals.add(approval_index)
                 approved = True
+                approval_reason = reason if kind == "denylist" else approval_reason
         item["reviewed"] = approved
+        if item["reviewed"] and kind == "denylist":
+            item["review_source"] = "owner approval"
+            item["review_status"] = "accepted by owner approval"
+            item["reason"] = approval_reason
         if details:
             item.update(details)
         key = tuple(sorted(item.items()))
@@ -206,31 +243,56 @@ class Scanner:
             text = raw.decode(encoding, errors="replace")
             for index, term in enumerate(self.terms):
                 pattern = re.escape(term)
-                if term.isalpha():
-                    pattern = r"(?<!\w)" + pattern + r"(?!\w)"
+                alphabetic = term.isalpha()
+                if alphabetic:
+                    # Include overlapping occurrences so an embedded hit cannot
+                    # conceal a later component/whole-word occurrence.
+                    pattern = "(?=(" + pattern + "))"
+                elif len(term) <= 3 and term.isalnum():
+                    # Short machine aliases are words, not substrings of lockfile hashes.
+                    pattern = r"(?<![A-Za-z0-9])" + pattern + r"(?![A-Za-z0-9])"
                 for match in re.finditer(pattern, text, re.I):
-                    self.add(scope, "personal", "denylist", path, text.count("\n", 0, match.start()) + 1, match.group(), index, object_id)
+                    group = 1 if alphabetic else 0
+                    start, end = match.span(group)
+                    reviewable = alphabetic and inside_letter_component(text, start, end)
+                    self.add(scope, "personal", "denylist", path, text.count("\n", 0, start) + 1, match.group(group), index, object_id,
+                             details={"reviewable": True} if reviewable else None)
             for number, line in enumerate(text.splitlines(), 1):
-                for match in re.finditer(EMAIL_PATTERN, line):
-                    address = match.group()
-                    if not placeholder_email(address, line):
-                        self.add(scope, "personal", "email-address", path, number, address, object_id=object_id)
-                for match in re.finditer(HOME_PATH_PATTERN, line):
-                    if not placeholder_home(match.group(1)):
-                        self.add(scope, "personal", "home-path", path, number, match.group(), object_id=object_id)
+                for kind, pattern in PATTERNS.items():
+                    for match in re.finditer(pattern, line, re.I):
+                        self.add(scope, "personal", kind, path, number, match.group(), object_id=object_id)
                 for url in self.private_repos:
                     # Match HTTPS, SSH and bare owner/repo references to known private repos.
-                    ref = re.sub(r"^(?:https?://github.com/|" r"git@github.com:)", "", url).removesuffix(".git").rstrip("/")
+                    ref = re.sub(r"^(?:https?://github.com/|git@github.com:)", "", url).removesuffix(".git").rstrip("/")
                     for match in re.finditer(re.escape(ref), line, re.I):
                         self.add(scope, "personal", "private-repo-url", path, number, match.group(), object_id=object_id)
+                for candidate in re.finditer(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|(?<![\w:])[0-9A-Fa-f:]*:[0-9A-Fa-f:]+(?:%[\w-]+)?(?![\w:])", line):
+                    value = candidate.group()
+                    if value == "::" and not (candidate.start() > 0 and line[candidate.start() - 1] in "\"'["):
+                        continue  # classifier/prose punctuation, not an address literal
+                    try:
+                        address = ipaddress.ip_address(value)
+                    except ValueError:
+                        continue
+                    kind = "tailnet-ip" if address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10") else "ipv" + str(address.version)
+                    self.add(scope, "personal", kind, path, number, value, object_id=object_id)
                 for kind, pattern in SECRET_PATTERNS.items():
                     for match in re.finditer(pattern, line):
                         self.add(scope, "secrets", kind, path, number, match.group(match.lastindex or 0), object_id=object_id)
+                for match in re.finditer(r"(?<![\w+/=-])[A-Za-z0-9_+=-]{32,}(?![\w+/=-])", line):
+                    value = match.group()
+                    # A hexadecimal content digest is not itself a credential. Explicit
+                    # key formats and labelled secrets above still take precedence.
+                    if opaque_secret(value):
+                        self.add(scope, "secrets", "entropy", path, number, value, object_id=object_id)
 
     def file(self, raw: bytes, scope: str, path: str, object_id: str | None = None):
         self.stats[scope + "_files"] += 1
         self.text(path.encode("utf-8", errors="surrogateescape"), scope, path, object_id)
         self.text(raw, scope, path, object_id)
+        name = Path(path).name.lower()
+        if name == ".env" or name.startswith(".env.") or re.search(r"(?:^|[_.-])(?:tokens?|credentials|id_rsa|id_ed25519)(?:[_.-]|$)", name) or Path(path).suffix.lower() in {".pem", ".key", ".p12", ".pfx"}:
+            self.add(scope, "secrets", "credential-file", path, value=raw, object_id=object_id)
         if Path(path).suffix.lower() in MEDIA:
             self.add(scope, "media", "manual-review", path, value=raw, object_id=object_id)
         elif Path(path).suffix.lower() in {".zip", ".gz", ".tar", ".7z", ".exe", ".dll", ".so", ".sqlite", ".db", ".bin"} or (b"\0" in raw and not raw.startswith((b"\xff\xfe", b"\xfe\xff"))):
@@ -316,9 +378,77 @@ def manifest_for(repo: Path, path: Path | None) -> dict:
         raise AuditError("manifest-schema")
     if not isinstance(obj.get("dependency_licenses", {}), dict):
         raise AuditError("manifest-schema")
+    verify_tools(obj)
     if any(not isinstance(p, str) or p.startswith("/") or ".." in Path(p).parts for p in obj["exclude"]):
         raise AuditError("manifest-path")
     return obj
+
+
+def verify_tools(manifest: dict) -> list[str]:
+    tools = manifest.get("verify_tools", [])
+    if (not isinstance(tools, list) or len(tools) > 8
+            or any(not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._+-]+", name)
+                   or name in {".", ".."} for name in tools)
+            or len(set(tools)) != len(tools)):
+        raise AuditError("manifest-schema")
+    return tools
+
+
+def dependency_free_package(repo: Path, path: Path, scanner: Scanner, identifier: str | None) -> bool:
+    def invalid_constant(value):
+        raise ValueError("invalid-json-constant")
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_METADATA_BYTES:
+            return False
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_METADATA_BYTES + 1)
+        if len(raw) > MAX_METADATA_BYTES:
+            return False
+        package = json.loads(raw, object_pairs_hook=unique_json_object, parse_constant=invalid_constant)
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(package, dict):
+        return False
+    if "license" in package and (not isinstance(package["license"], str) or package["license"] != identifier):
+        scanner.add("tree", "license", "license-metadata-mismatch", path.relative_to(repo).as_posix(), value=json.dumps(package["license"], sort_keys=True))
+    if "licenses" in package or package.get("gypfile"):
+        return False
+    if any(package.get(key) for key in ("dependencies", "devDependencies", "optionalDependencies",
+                                       "peerDependencies", "bundledDependencies", "bundleDependencies",
+                                       "workspaces", "overrides", "resolutions")):
+        return False
+    scripts = package.get("scripts", {})
+    if not isinstance(scripts, dict) or any(not isinstance(value, str) for value in scripts.values()):
+        return False
+    if any(name in {"install", "prepare", "publish", "dependencies"}
+           or name.startswith(("pre", "post")) for name in scripts):
+        return False
+    return True
+
+
+def node_packages(repo: Path) -> tuple[list[Path], list[Path], bool]:
+    packages, hooks = [], []
+    artifacts = False
+    lockfiles = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb"}
+    def unreadable(error):
+        raise error
+    for root, dirs, files in os.walk(repo, followlinks=False, onerror=unreadable):
+        dirs[:] = [name for name in dirs if name != ".git"]
+        for name in files + dirs:
+            path = Path(root) / name
+            if name == "package.json":
+                packages.append(path)
+            if name == "binding.gyp":
+                hooks.append(path)
+            if name in lockfiles or name == "node_modules":
+                artifacts = True
+    for raw_path in filter(None, git(repo, "ls-files", "-z").split(b"\0")):
+        parts = Path(raw_path.decode("utf-8", "surrogateescape")).parts
+        if parts[-1] in lockfiles or "node_modules" in parts:
+            artifacts = True
+        if parts[-1] == "binding.gyp":
+            artifacts = True
+    return packages, hooks, artifacts
 
 
 def license_audit(repo: Path, scanner: Scanner, manifest: dict) -> dict:
@@ -327,43 +457,70 @@ def license_audit(repo: Path, scanner: Scanner, manifest: dict) -> dict:
     if not candidates:
         scanner.add("tree", "license", "missing-license", "LICENSE")
         return result
-    identifiers = [project_license_identifier(decode_licence(p.read_bytes())) for p in candidates]
-    if any(identifier is None for identifier in identifiers) or len(set(identifiers)) != 1:
-        for candidate, identifier in zip(candidates, identifiers):
-            if identifier is None or len(set(identifiers)) != 1:
-                scanner.add("tree", "license", "unrecognized-or-modified-license", candidate.name,
-                            value=decode_licence(candidate.read_bytes()))
-    else:
-        result.update(status="pass", identifier=identifiers[0])
-    declared_values = []
+    def standard_mit(text):
+        # Account for the entire document, including text before the grant.
+        return (licence_file_state(text) == 'accepted'
+                and hashlib.sha256(licence_text_key(text, root_mit=True).encode()).hexdigest() in LICENSE_TEXTS['MIT'][1])
+    valid = True
+    for candidate in candidates:
+        text = decode_licence(candidate.read_bytes())
+        if not standard_mit(text):
+            valid = False
+            scanner.add("tree", "license", "unrecognized-or-modified-license", candidate.name, value=text)
+    if valid:
+        result.update(status="pass", identifier="MIT")
     project = {}
-    pyproject = repo / "pyproject.toml"
-    if pyproject.is_file():
-        project = tomllib.loads(pyproject.read_text()).get("project", {})
-        if project.get("license") is not None:
-            declared = project["license"]
-            if isinstance(declared, dict) and set(declared) == {"text"}:
-                declared = declared["text"]
-            elif isinstance(declared, dict) and set(declared) == {"file"} and isinstance(declared["file"], str):
-                path = Path(declared["file"])
-                if not path.is_absolute() and ".." not in path.parts and (repo / path).is_file() and not (repo / path).is_symlink():
-                    declared = project_license_identifier(decode_licence((repo / path).read_bytes()))
-            declared_values.append(("pyproject.toml", declared))
-    package_json = repo / "package.json"
-    if package_json.is_file():
-        package = json.loads(package_json.read_text())
-        if isinstance(package, dict) and package.get("license") is not None:
-            declared_values.append(("package.json", package["license"]))
-    for path, declared in declared_values:
-        if declared != result["identifier"]:
-            scanner.add("tree", "license", "license-metadata-mismatch", path,
-                        value=json.dumps(declared, sort_keys=True))
+    if (repo / "pyproject.toml").exists():
+        project = tomllib.loads((repo / "pyproject.toml").read_text()).get("project", {})
+        declared = project.get("license")
+        if declared is not None:
+            matches = declared == result['identifier']
+            if isinstance(declared, dict):
+                if set(declared) == {'text'} and isinstance(declared['text'], str):
+                    matches = declared['text'] == 'MIT' or standard_mit(declared['text'])
+                elif set(declared) == {'file'} and isinstance(declared['file'], str):
+                    path = Path(declared['file'])
+                    matches = (not path.is_absolute() and '..' not in path.parts
+                               and (repo / path).is_file() and not (repo / path).is_symlink()
+                               and standard_mit(decode_licence((repo / path).read_bytes())))
+            if not matches:
+                scanner.add("tree", "license", "license-metadata-mismatch", "pyproject.toml", value=json.dumps(declared, sort_keys=True))
+        if "dynamic" in project and any(x in project["dynamic"] for x in ("dependencies", "license")):
+            scanner.add("tree", "license", "dynamic-license-or-dependencies", "pyproject.toml")
+    packages, hooks, artifacts = node_packages(repo)
+    package_free = bool(packages)
+    for path in packages:
+        free = dependency_free_package(repo, path, scanner, result["identifier"])
+        if not free or hooks or artifacts:
+            package_free = False
+            scanner.add("tree", "license", "dependency-ecosystem-manual-review", path.relative_to(repo).as_posix())
+    if not packages:
+        for path in hooks:
+            scanner.add("tree", "license", "dependency-ecosystem-manual-review", path.relative_to(repo).as_posix())
+    # Unknown ecosystems do not become a false green.
+    for name in ("Cargo.toml", "go.mod", "pom.xml", "Gemfile", "composer.json", "build.gradle", "build.gradle.kts", "Package.swift", "environment.yml", "Pipfile", "setup.py", "setup.cfg"):
+        if (repo / name).exists():
+            scanner.add("tree", "license", "dependency-ecosystem-manual-review", name)
+    for path in repo.glob("*.csproj"):
+        scanner.add("tree", "license", "dependency-ecosystem-manual-review", path.name)
+    if (repo / "pyproject.toml").exists() and "poetry" in tomllib.loads((repo / "pyproject.toml").read_text()).get("tool", {}):
+        scanner.add("tree", "license", "dependency-ecosystem-manual-review", "pyproject.toml")
+    for name in ("vendor", "vendored", "third_party", "third-party"):
+        if (repo / name).is_dir():
+            scanner.add("tree", "license", "vendored-attribution-review", name)
     deps = bool(project.get("dependencies") or project.get("optional-dependencies"))
     for path in repo.glob("*requirements*.txt"):
         if any(line.strip() and not line.lstrip().startswith("#") for line in path.read_text().splitlines()):
             deps = True
-    if not deps:
-        result["dependencies"] = "stdlib-only"
+    if not deps and (not packages or package_free):
+        result["dependencies"] = "none (package.json)" if package_free else "stdlib-only"
+    # Attribution is never silently discarded, even when an export manifest excludes it.
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d != ".git" and d not in GENERATED]
+        for name in files:
+            rel = (Path(root) / name).relative_to(repo).as_posix()
+            if protected(rel) and match_path(rel, [*DEFAULT_EXCLUDES, *manifest["exclude"]]):
+                scanner.add("tree", "license", "excluded-attribution", rel)
     return result
 
 
@@ -791,36 +948,6 @@ LICENSE_TEXTS = {
     'PSF-2.0': (('python software foundation', 'worldwide license to reproduce analyze test', 'relationship of agency partnership or joint venture'), ['2366c0b8707a123d4de87ccc1a0c859aabcd37d4f5bab83eff1364a23f202ffe']),
 }
 
-SPDX_LICENSES = {
-    "MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "MPL-2.0",
-    *(f"{family}-{version}" for family, versions in (
-        ("GPL", ("1.0", "2.0", "3.0")), ("AGPL", ("3.0",)),
-        ("LGPL", ("2.0", "2.1", "3.0")),
-    ) for version in versions),
-    *(f"{family}-{version}-{suffix}" for family, versions in (
-        ("GPL", ("1.0", "2.0", "3.0")), ("AGPL", ("3.0",)),
-        ("LGPL", ("2.0", "2.1", "3.0")),
-    ) for version in versions for suffix in ("only", "or-later")),
-}
-
-
-def project_license_identifier(text: str) -> str | None:
-    """Identify only a known SPDX declaration or an intact canonical licence text."""
-    if len(text.encode("utf-8")) > MAX_LICENSE_BYTES or not readable_licence(text):
-        return None
-    declarations = re.findall(r"^[ \t]*SPDX-License-Identifier:[ \t]*([^\r\n]+)$", text, re.I | re.M)
-    body = re.sub(r"^[ \t]*SPDX-License-Identifier:[^\r\n]*", "", text, flags=re.I | re.M)
-    if declarations:
-        if len(declarations) != 1 or body.strip():
-            return None
-        identifier = declarations[0].strip()
-        return identifier if identifier in SPDX_LICENSES else None
-    key = hashlib.sha256(licence_text_key(text, root_mit=True).encode()).hexdigest()
-    for identifier, (_, digests) in LICENSE_TEXTS.items():
-        if identifier in SPDX_LICENSES and key in digests:
-            return identifier
-    return None
-
 
 def licence_text_key(text: str, *, root_mit: bool = False) -> str:
     text = licence_characters(text)
@@ -926,15 +1053,6 @@ def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -
     if len(packages) > MAX_PACKAGES:
         limit()
         return {"packages": len(packages), "blocked": 1, "accepted_on_license_file": []}
-    project_names = set()
-    for filename, parse in (("pyproject.toml", tomllib.loads), ("package.json", json.loads)):
-        path = repo / filename
-        if path.is_file():
-            metadata = parse(path.read_text())
-            project = metadata.get("project", {}) if filename == "pyproject.toml" else metadata
-            name = project.get("name")
-            if isinstance(name, str) and name.strip():
-                project_names.add(re.sub(r"[-_.]+", "-", name).lower())
     count, accepted_files = 0, []
     for package in packages:
         if not isinstance(package, dict):
@@ -949,8 +1067,6 @@ def dependency_audit(raw: bytes, repo: Path, scanner: Scanner, manifest: dict) -
             return invalid()
         name = package["name"]
         normalized = re.sub(r"[-_.]+", "-", name).lower()
-        if normalized in project_names:
-            continue  # The project's root licence is checked separately.
         expressions = [package.get("expression") or "", *package.get("expressions", [])]
         legacy = [package.get("license") or "", *package.get("licenses", [])]
         if any(licence_expression_limited(value) for value in expressions) or any(
@@ -1038,18 +1154,19 @@ def requirements_text() -> str:
     }
     return "\n".join([
         "Release requirements (no repository needed):",
-        "Root licence: one of " + ", ".join(ROOT_LICENSE_FILES) + " (case insensitive); a known SPDX identifier or intact known SPDX text. pyproject.toml and package.json declarations must agree.",
+        "Root licence: one of " + ", ".join(ROOT_LICENSE_FILES) + " (case insensitive); standard unmodified MIT grant/disclaimer. Other licences need manual review.",
         "Required root documents: " + ", ".join(REQUIRED_DOCUMENTS) + ".",
         "README.md Markdown heading containing (case insensitive): " + ", ".join(README_HEADINGS) + ".",
         "Issue template: " + ISSUE_TEMPLATE_DIR + "/ with a file matching " + " or ".join(ISSUE_TEMPLATE_GLOBS) + " (.md, .yml or .yaml).",
         "Tests: at least one " + TEST_DIR + "/" + TEST_GLOB + " (subdirectories allowed).",
         "release-check.json keys: " + ", ".join(MANIFEST_KEYS) + ". license is a legacy optional field, not an override.",
-        "exclude: relative path/glob strings. approvals: objects with scope, kind, path, fingerprint.",
-        "Denylist hits and secrets cannot be waived.",
-        "Alphabetic private terms: case-insensitive whole words only, bounded by non-word characters (letters, digits and underscores are word characters). Terms containing nonletters match literal strings. No embedded-word matching or review class.",
+        "exclude: relative path/glob strings; attribution must be preserved. approvals: objects with scope, kind, path, fingerprint.",
+        "Denylist hits require exact owner approval; secrets cannot be waived.",
+        "Alphabetic private terms: case-insensitive whole words/components block; substrings confined to one longer Unicode letter component are reviewable, not blockers. Punctuation, digits, underscores and camelCase/acronym transitions delimit components. Adjacent combining marks, invisible format characters or decoding replacements, matches crossing case transitions, and ambiguous uppercase-acronym/lowercase joins stay blocking. Other terms keep literal matching, with the existing short-alphanumeric alias boundaries.",
         "Dependency approvals also require a nonempty reason. Copy scope, kind, path and fingerprint from the report; the fingerprint binds name, exact version, metadata, all licence-file hashes and any supplied dependency_licenses entry. Stale reviews stop applying; reviewed findings remain visible.",
         "quickstart: nonempty entries with file, one-based line, argv (a nonempty string array); the documentation line must shell-split to exactly argv.",
         "checks: nonempty entries with argv; at least one role=tests. Accepted roles: " + ", ".join(CHECK_ROLES) + ".",
+        "verify_tools: optional list of at most 8 distinct bare executable names matching ^[A-Za-z0-9._+-]+$ (excluding . and ..). Only absolute caller PATH entries are searched; relative and empty entries are ignored. Regular executable targets must resolve outside the audited repository, original source, reports and export. Missing, unsafe or conflicting tools block verification. The caller's PATH and environment are not inherited.",
         "Configured checks: " + ", ".join(name + " requires role=" + role for name, role in CONFIGURED_CHECKS) + ".",
         "dependency_licenses: normalized package-name keys with exact version, spdx expression, sha256 (full installed licence-document digest); existing lowercase-name keys also work, but conflicting aliases block coverage. Resolutions remain visible as reviewed findings; evidence cannot erase GPL/AGPL or proprietary indications, even after parsing fails, or waive another unknown file. Empty/corrupt/binary files cannot supply resolutions.",
         "Recognised permissive identifiers: " + ", ".join(sorted(COMPATIBLE)) + ". Human-readable metadata/classifiers are also recognised.",
@@ -1057,7 +1174,7 @@ def requirements_text() -> str:
         "Dependency policy: recognised permissive and weak copyleft accepted; GPL/AGPL or proprietary indications from independent sources win. Unknown licences need review. Unlabelled packages need recognizable permissive/weak-copyleft text or valid SPDX declarations. OR needs an acceptable branch; otherwise stronger indications survive. AND needs every part acceptable. License :: OSI Approved alone is neutral. Missing inventory/files, corrupt metadata, malformed headers and duplicate JSON keys block coverage.",
         "Example manifest for your own repository (assumes its README line 3 is: python -m pip install .; adjust file, line and argv to match your documentation):",
         json.dumps(example, indent=2),
-        "Passing also requires an external denylist, complete local history, no unresolved denylist/secret/media/metadata findings, and --verify in a fresh clone/venv/HOME. Install the project and test tools through declared commands. Export rescans a clean one-commit copy; nothing is published."
+        "Passing also requires an external denylist, complete local history and attribution, no unresolved personal/secret/path/hostname/email/media/metadata findings, and --verify in a fresh clone/venv/HOME. Install the project and test tools through declared commands. Export rescans a clean one-commit copy; nothing is published."
     ]) + "\n"
 
 
@@ -1077,16 +1194,35 @@ def venv_failure(output: bytes, scanner: Scanner, ensurepip_missing: bool = Fals
         text = re.sub(re.escape(term), "[redacted]", text, flags=re.I)
     for value in scanner.private_repos:
         text = re.sub(re.escape(value), "[redacted]", text, flags=re.I)
-    for pattern in [*SECRET_PATTERNS.values(), r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)", r"(?<![\w:])[0-9A-Fa-f]*:[0-9A-Fa-f:]+(?:%[\w-]+)?(?![\w:])"]:
+    for pattern in [*PATTERNS.values(), *SECRET_PATTERNS.values(), r"(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)", r"(?<![\w:])[0-9A-Fa-f]*:[0-9A-Fa-f:]+(?:%[\w-]+)?(?![\w:])"]:
         text = re.sub(pattern, "[redacted]", text, flags=re.I)
     text = re.sub(r"[A-Za-z0-9_+=-]{32,}", lambda m: "[redacted]" if opaque_secret(m.group()) else m.group(), text)
     tail = "".join(c for c in text if c in "\n\t" or c.isprintable()).strip()[-1000:]
     return {"cause": "other-venv-error", "message": f"Python {version} virtual environment creation failed; the error does not identify missing ensurepip. See the redacted error tail.", "error_tail": tail}
 
 
-def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int) -> dict:
+def resolve_verify_tool(name: str, excluded: tuple[Path, ...]) -> Path:
+    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not Path(entry).is_absolute():
+            continue
+        candidate = Path(entry) / name
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            continue
+        target = candidate.resolve(strict=True)
+        if (not target.is_absolute() or not target.is_file() or not os.access(target, os.X_OK)
+                or any(candidate.is_relative_to(path) or target.is_relative_to(path) for path in excluded)):
+            raise OSError("verify-tool-missing")
+        return target
+    raise OSError("verify-tool-missing")
+
+
+def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeout: int,
+           *, tool_exclusions: tuple[Path, ...] = ()) -> dict:
     results = []
     result = {"status": "blocked", "commands": results, "dependencies": None}
+    tools = verify_tools(manifest)
     if not manifest["quickstart"] or not manifest["checks"]:
         scanner.add("verification", "quality", "verification-not-configured", "release-check.json")
         return result
@@ -1105,6 +1241,15 @@ def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeo
             if not isinstance(number, int) or not 1 <= number <= len(lines) or shlex.split(lines[number - 1]) != argv:
                 scanner.add("verification", "quality", "quickstart-document-mismatch", doc, number if isinstance(number, int) else 0)
                 return result
+    resolved_tools = {}
+    excluded = tuple(path.resolve() for path in (repo, report_dir, *tool_exclusions))
+    for name in tools:
+        try:
+            target = resolve_verify_tool(name, excluded)
+        except (OSError, RuntimeError):
+            scanner.add("verification", "quality", "verify-tool-missing", "release-check.json", value=name)
+            return result
+        resolved_tools[name] = target
     with tempfile.TemporaryDirectory(prefix="verify-", dir=report_dir) as tmp:
         workspace = Path(tmp)
         snapshot = workspace / "snapshot"
@@ -1121,7 +1266,16 @@ def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeo
             probe_code, _ = command([sys.executable, "-c", probe], workspace, creation_environment, timeout)
             scanner.add("verification", "quality", "venv-creation-failed", "release-check.json", value=output, details=venv_failure(output, scanner, ensurepip_missing=probe_code == 3))
             return result
-        environment = safe_environment(workspace / "home", env_dir / "bin")
+        bin_dir = env_dir / "bin"
+        for name, target in resolved_tools.items():
+            try:
+                if bin_dir.is_symlink() or not bin_dir.resolve().is_relative_to(env_dir.resolve()):
+                    raise OSError("verify-tool-missing")
+                (bin_dir / name).symlink_to(target)
+            except OSError:
+                scanner.add("verification", "quality", "verify-tool-missing", "release-check.json", value=name)
+                return result
+        environment = safe_environment(workspace / "home", bin_dir)
         for step, item in enumerate([*manifest["quickstart"], *manifest["checks"]], 1):
             code, output = command(item["argv"], clean, environment, timeout)
             results.append({"step": step, "role": item.get("role", "quickstart"), "exit_code": code, "output_fingerprint": fingerprint(output)})
@@ -1150,20 +1304,22 @@ def verify(repo: Path, report_dir: Path, scanner: Scanner, manifest: dict, timeo
     return result
 
 
-def audit(repo: Path, terms: list[str], manifest: dict, private_repos: list[str], verify_commands: bool, report_dir: Path, timeout: int) -> dict:
+def audit(repo: Path, terms: list[str], manifest: dict, private_repos: list[str], verify_commands: bool, report_dir: Path, timeout: int,
+          *, tool_exclusions: tuple[Path, ...] = ()) -> dict:
     scanner = Scanner(terms, private_repos, manifest["approvals"])
     scanner.tree(repo)
     scanner.history(repo)
     licensing = license_audit(repo, scanner, manifest)
     quality_audit(repo, scanner, manifest)
     if verify_commands:
-        verification = verify(repo, report_dir, scanner, manifest, timeout)
+        verification = verify(repo, report_dir, scanner, manifest, timeout, tool_exclusions=tool_exclusions)
         if verification.get("dependencies") is not None:
             licensing["dependencies"] = "pass" if not verification["dependencies"]["blocked"] else "blocked"
     else:
         verification = {"status": "not-run", "commands": []}
         scanner.add("verification", "quality", "verification-not-run", "release-check.json")
-    findings = scanner.findings
+    reviewable = [f for f in scanner.findings if f.get("reviewable")]
+    findings = [f for f in scanner.findings if not f.get("reviewable")]
     unresolved = [f for f in findings if not f["reviewed"]]
     def safe_approval_value(key, value):
         if key == "path" and isinstance(value, str):
@@ -1176,7 +1332,143 @@ def audit(repo: Path, terms: list[str], manifest: dict, private_repos: list[str]
          for key in ("scope", "kind", "path", "fingerprint") if key in approval}
         for index, approval in enumerate(manifest["approvals"]) if index not in scanner.matched_approvals
     ]
-    return {"version": VERSION, "ready": not unresolved, "counts": dict(Counter(f["category"] for f in unresolved)), "reviewed_count": sum(f["reviewed"] for f in scanner.findings), "stale_approvals": stale_approvals, "stats": dict(scanner.stats), "license": licensing, "verification": verification, "findings": findings}
+    report = {"version": VERSION, "counts": dict(Counter(f["category"] for f in unresolved)), "reviewed_count": sum(f["reviewed"] for f in findings), "reviewable_count": len(reviewable), "reviewable_findings": reviewable, "stale_approvals": stale_approvals, "stats": dict(scanner.stats), "license": licensing, "verification": verification, "findings": findings}
+    report.update(outcome(report))
+    return report
+
+
+def outcome(report: dict) -> dict:
+    unresolved = [f for f in report.get("findings", []) if not f.get("reviewed", False)]
+    reasons = {f["kind"] for f in unresolved}
+    failed = any(f.get("category") != "coverage" and f["kind"] not in INCOMPLETE_KINDS for f in unresolved)
+    if report.get("verification", {}).get("status") != "pass":
+        reasons.add("verification-not-passed")
+    licensing = report.get("license", {})
+    if licensing.get("status") != "pass":
+        reasons.add("license-not-passed")
+    if licensing.get("dependencies") not in {"pass", "stdlib-only", "none (package.json)"}:
+        reasons.add("dependencies-not-verified")
+    for counter, reason in (("tree_files", "empty-tree"), ("history_commits", "empty-history")):
+        count = report.get("stats", {}).get(counter)
+        if type(count) is not int or count < 1:
+            reasons.add(reason)
+    status = "FAIL" if failed else "INCOMPLETE" if reasons else "PASS"
+    return {"outcome": status, "reasons": sorted(reasons), "ready": status == "PASS"}
+
+
+def canonical_json(value) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+
+
+def sha256(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def inventory_digest(repo: Path) -> str:
+    entries = []
+    def unreadable(error):
+        raise error
+    for root, dirs, files in os.walk(repo, followlinks=False, onerror=unreadable):
+        directory = Path(root)
+        entries.append((b"path", os.fsencode(directory.relative_to(repo)), b"directory",
+                        str(stat.S_IMODE(directory.lstat().st_mode)).encode()))
+        links = [name for name in dirs if (Path(root) / name).is_symlink()]
+        dirs[:] = [name for name in dirs if name not in links]
+        for name in files + links:
+            path = Path(root) / name
+            relative = path.relative_to(repo)
+            if relative.parts[0] == ".git" and (relative == Path(".git/index") or name.endswith(".lock")):
+                continue
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                kind, raw = b"symlink", os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(mode):
+                kind, raw = b"file", path.read_bytes()
+            else:
+                raise AuditError("unsupported-inventory-file")
+            entries.append((b"path", os.fsencode(relative), kind,
+                            str(stat.S_IMODE(mode)).encode(), sha256(raw).encode()))
+    entries.extend([(b"refs", git(repo, "for-each-ref")),
+                    (b"head", git(repo, "rev-parse", "HEAD"), git(repo, "rev-parse", "--symbolic-full-name", "HEAD"))])
+    digest = hashlib.sha256()
+    for entry in sorted(entries):
+        digest.update(len(entry).to_bytes(8, "big"))
+        for field in entry:
+            digest.update(len(field).to_bytes(8, "big"))
+            digest.update(field)
+    return digest.hexdigest()
+
+
+def receipt_bindings(repo: Path, args, *, tolerate_errors: bool = False) -> dict:
+    sources = {
+        "inventory": lambda: inventory_digest(repo),
+        "recipe": lambda: sha256(canonical_json(manifest_for(repo, args.manifest))),
+        "policy": lambda: sha256(canonical_json({
+            "denylist_sha256": sha256(Path(args.denylist).expanduser().read_bytes()),
+            "private_repos_sha256": sha256(canonical_json(sorted(args.private_repo))),
+            "default_excludes": DEFAULT_EXCLUDES, "verify": args.verify, "timeout": args.timeout})),
+        "scanners": lambda: sha256(canonical_json({
+            "release-check": {"version": VERSION, "sha256": sha256(Path(__file__).read_bytes())},
+            "python": sys.version, "git": git(repo, "--version").decode().strip()})),
+    }
+    bindings = {}
+    for name, read in sources.items():
+        try:
+            bindings[name] = read()
+        except (AuditError, OSError, ValueError, TypeError, RecursionError):
+            if not tolerate_errors:
+                raise
+            bindings[name] = None
+    return bindings
+
+
+def write_receipt(directory: Path, repo: Path, report: dict, args):
+    receipt = {"schema_version": 1, "outcome": report["outcome"], "reasons": report["reasons"],
+               "created_at": datetime.now(timezone.utc).isoformat(),
+               "export_head": git(repo, "rev-parse", "HEAD").decode().strip(),
+               "export_tree": git(repo, "rev-parse", "HEAD^{tree}").decode().strip(),
+               "bindings": receipt_bindings(repo, args)}
+    receipt["receipt_sha256"] = sha256(canonical_json(receipt))
+    fd = os.open(directory / "receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(canonical_json(receipt) + b"\n")
+
+
+def validate_receipt(path: Path, repo: Path, args) -> dict:
+    invalid = {"outcome": "INCOMPLETE", "reasons": ["receipt-invalid"], "mismatched": []}
+    try:
+        with path.open("rb") as handle:
+            if os.fstat(handle.fileno()).st_size > MAX_RECEIPT_BYTES:
+                return invalid
+            raw = handle.read(MAX_RECEIPT_BYTES + 1)
+        if len(raw) > MAX_RECEIPT_BYTES:
+            return invalid
+        receipt = json.loads(raw, object_pairs_hook=unique_json_object)
+        if not isinstance(receipt, dict):
+            return invalid
+        body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+        if (type(receipt.get("schema_version")) is not int or receipt["schema_version"] != 1
+                or receipt.get("receipt_sha256") != sha256(canonical_json(body))
+                or receipt.get("outcome") not in {"PASS", "FAIL", "INCOMPLETE"}
+                or not isinstance(receipt.get("reasons"), list)
+                or any(not isinstance(r, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", r) for r in receipt["reasons"])
+                or not isinstance(receipt.get("bindings"), dict)
+                or set(receipt["bindings"]) != {"inventory", "recipe", "policy", "scanners"}
+                or any(not isinstance(v, str) or not re.fullmatch(r"[a-f0-9]{64}", v) for v in receipt["bindings"].values())
+                or not isinstance(receipt.get("created_at"), str)
+                or any(not isinstance(receipt.get(k), str) or not re.fullmatch(r"[a-f0-9]{40,64}", receipt[k]) for k in ("export_head", "export_tree"))
+                or (receipt["outcome"] == "PASS" and receipt["reasons"])):
+            return invalid
+        current = receipt_bindings(repo, args, tolerate_errors=True)
+        mismatched = sorted(key for key in current if current[key] != receipt["bindings"][key])
+        if "inventory" not in mismatched and (
+                receipt["export_head"] != git(repo, "rev-parse", "HEAD").decode().strip()
+                or receipt["export_tree"] != git(repo, "rev-parse", "HEAD^{tree}").decode().strip()):
+            mismatched = sorted(set(mismatched) | {"inventory"})
+        return {"outcome": "INCOMPLETE" if mismatched else receipt["outcome"],
+                "reasons": ["receipt-stale"] if mismatched else receipt["reasons"], "mismatched": mismatched}
+    except (AuditError, OSError, ValueError, TypeError, KeyError, RecursionError, MemoryError):
+        return invalid
 
 
 def scrub_plan(report: dict, repo: Path, manifest: dict, scanner: Scanner) -> dict:
@@ -1209,6 +1501,10 @@ def write_reports(directory: Path, report: dict):
         md += [f"| {a.get('scope', '')} | {a.get('kind', '')} | {a.get('path', '')} | {a.get('fingerprint', '')} |" for a in report["stale_approvals"]]
     if diagnostics:
         md += ["", *diagnostics]
+    md += ["", "## Reviewable private-term hits (nonblocking)", "", "Count: " + str(report.get("reviewable_count", 0)), "", "| Scope | Path | Line | Fingerprint | Term index |", "| --- | --- | ---: | --- | ---: |"]
+    for f in report.get("reviewable_findings", []):
+        path = f["path"].replace("|", "&#124;").replace("<", "&lt;").replace(">", "&gt;")
+        md.append(f"| {f['scope']} | {path} | {f['line']} | {f['fingerprint']} | {f['term_index']} |")
     if "export" in report:
         md += ["", "## Export", "", "Ready: " + str(report["export"]["ready"]).lower(), "", "Counts: " + json.dumps(report["export"]["counts"], sort_keys=True), "", "Export findings and verification are in report.json."]
     if "scrub_plan" in report:
@@ -1223,24 +1519,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = PrivateParser(description=__doc__)
     parser.add_argument("repo", type=Path, nargs="?")
     parser.add_argument("--requirements", action="store_true", help="Print required files, README headings and manifest shape without scanning")
-    parser.add_argument("--denylist", type=Path, default=os.environ.get("RELEASE_CHECK_DENYLIST") or None, help="External terms file (default: RELEASE_CHECK_DENYLIST)")
-    parser.add_argument("--reports", type=Path, default=os.environ.get("RELEASE_CHECK_REPORTS", "~/.local/state/release-check") or None, help="Private report directory (default: RELEASE_CHECK_REPORTS or ~/.local/state/release-check)")
+    parser.add_argument("--denylist", type=Path, default=os.environ.get("RELEASE_CHECK_DENYLIST"))
+    parser.add_argument("--reports", type=Path, default=os.environ.get("RELEASE_CHECK_REPORTS", "~/.local/state/release-check"))
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--private-repo", action="append", default=[], help="Known-private repo URL or owner/name; kept out of reports")
     parser.add_argument("--verify", action="store_true", help="Execute reviewed manifest quickstart/check argv in a fresh local clone and venv")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--scrub-plan", action="store_true")
     parser.add_argument("--export", type=Path)
+    parser.add_argument("--validate-receipt", type=Path, nargs=2, metavar=("RECEIPT_JSON", "EXPORT_DIR"))
     args = parser.parse_args(argv)
     if args.requirements:
         print(requirements_text(), end="")
         return 0
-    if args.repo is None:
+    if args.repo is None and not args.validate_receipt:
         parser.error("pass a repository or --requirements")
     if not args.denylist:
-        parser.configuration_error("Pass --denylist /private/terms.json or set RELEASE_CHECK_DENYLIST. Pass --reports /private/reports or set RELEASE_CHECK_REPORTS to choose the private report directory; otherwise ~/.local/state/release-check is used.")
-    if not args.reports:
-        parser.configuration_error("Pass --reports /private/reports or set RELEASE_CHECK_REPORTS to a nonempty directory path.")
+        parser.error("pass --denylist or set RELEASE_CHECK_DENYLIST")
+    if args.validate_receipt:
+        result = validate_receipt(args.validate_receipt[0].expanduser(), args.validate_receipt[1].expanduser().resolve(), args)
+        print(json.dumps(result, sort_keys=True))
+        return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[result["outcome"]]
     os.umask(0o077)
     directory = None
     try:
@@ -1256,6 +1555,8 @@ def main(argv: list[str] | None = None) -> int:
             raise AuditError("reports-inside-source")
         if args.export:
             target = args.export.expanduser().resolve()
+            if root == target or target in root.parents:
+                raise AuditError("reports-inside-export")
             if target == denylist or target in denylist.parents:
                 raise AuditError("export-contains-denylist")
         if args.timeout < 1:
@@ -1270,21 +1571,51 @@ def main(argv: list[str] | None = None) -> int:
         directory = root / name / stamp
         directory.mkdir(mode=0o700, parents=True)
         directory.chmod(0o700)
-        report = audit(repo, terms, manifest, args.private_repo, args.verify, directory, args.timeout)
+        tool_exclusions = (repo, root, args.export.expanduser().resolve()) if args.export else (repo, root)
+        report = audit(repo, terms, manifest, args.private_repo, args.verify, directory, args.timeout, tool_exclusions=tool_exclusions)
         if args.scrub_plan:
             report["scrub_plan"] = scrub_plan(report, repo, manifest, scanner)
         if args.export:
             target = args.export.expanduser().resolve()
             copy_tree(repo, target, manifest, scanner)
-            export_report = audit(target, terms, manifest_for(target, args.manifest), args.private_repo, args.verify, directory, args.timeout)
+            candidate_inventory = inventory_digest(target)
+            export_report = audit(target, terms, manifest_for(target, args.manifest), args.private_repo, args.verify, directory, args.timeout, tool_exclusions=tool_exclusions)
             for finding in scanner.findings:
                 export_report["findings"].append(finding)
                 export_report["counts"][finding["category"]] = export_report["counts"].get(finding["category"], 0) + 1
-                export_report["ready"] = False
+            # Historical attribution must survive the public snapshot, not only current files.
+            for commit in git(repo, "rev-list", "--all", "--reflog").splitlines():
+                for entry in filter(None, git(repo, "ls-tree", "-r", "-z", commit.decode()).split(b"\0")):
+                    metadata, raw_path = entry.split(b"\t", 1)
+                    path = raw_path.decode("utf-8", "surrogateescape")
+                    if protected(path) and not (target / path).is_file():
+                        finding_scanner = Scanner(terms)
+                        finding_scanner.add("export", "license", "historical-attribution-missing", path, value=metadata)
+                        export_report["findings"].extend(finding_scanner.findings)
+                        export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
+                    elif protected(path) and any(x in Path(path).name.upper() for x in ("NOTICE", "UPSTREAM")):
+                        oid = metadata.split()[2].decode()
+                        old_raw = git(repo, "cat-file", "blob", oid)
+                        old = re.sub(rb"\s+", b" ", old_raw).strip()
+                        current = re.sub(rb"\s+", b" ", (target / path).read_bytes()).strip()
+                        if any(re.sub(rb"\s+", b" ", line).strip() not in current for line in old_raw.splitlines() if line.strip()):
+                            finding_scanner = Scanner(terms)
+                            finding_scanner.add("export", "license", "historical-attribution-changed", path, value=old)
+                            export_report["findings"].extend(finding_scanner.findings)
+                            export_report["counts"]["license"] = export_report["counts"].get("license", 0) + 1
+            if inventory_digest(target) != candidate_inventory:
+                finding_scanner = Scanner(terms)
+                finding_scanner.add("export", "quality", "candidate-mutated", ".")
+                export_report["findings"].extend(finding_scanner.findings)
+                export_report["counts"]["quality"] = export_report["counts"].get("quality", 0) + 1
+            export_report.update(outcome(export_report))
             report["export"] = export_report
         write_reports(directory, report)
-        summary = {"ready": report["ready"], "counts": report["counts"]}
         if "export" in report:
+            write_receipt(directory, target, report["export"], args)
+        summary = {"outcome": report["outcome"], "ready": report["ready"], "counts": report["counts"]}
+        if "export" in report:
+            summary["export_outcome"] = report["export"]["outcome"]
             summary["export_ready"] = report["export"]["ready"]
             summary["export_counts"] = report["export"]["counts"]
         # Only the relative report locator is printed (home names stay private).
@@ -1292,11 +1623,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary))
         if args.scrub_plan:
             print(json.dumps(report["scrub_plan"], indent=2))
-        return 0 if report.get("export", report)["ready"] else 1
+        return {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2}[report.get("export", report)["outcome"]]
     except (AuditError, OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError, subprocess.SubprocessError):
         if directory is not None and not (directory / "report.json").exists():
-            write_reports(directory, {"version": VERSION, "ready": False, "counts": {"coverage": 1}, "license": {"status": "unknown"}, "verification": {"status": "incomplete"}, "findings": [{"scope": "audit", "category": "coverage", "kind": "audit-incomplete", "path": "@audit", "line": 0, "fingerprint": fingerprint(b"audit-incomplete"), "reviewed": False}]})
-        print('{"ready":false,"error":"audit-incomplete"}', file=sys.stderr)
+            incomplete = {"version": VERSION, "ready": False, "counts": {"coverage": 1}, "license": {"status": "unknown"}, "verification": {"status": "incomplete"}, "findings": [{"scope": "audit", "category": "coverage", "kind": "audit-incomplete", "path": "@audit", "line": 0, "fingerprint": fingerprint(b"audit-incomplete"), "reviewed": False}]}
+            incomplete.update(outcome(incomplete))
+            write_reports(directory, incomplete)
+        print('{"outcome":"INCOMPLETE","ready":false,"error":"audit-incomplete"}', file=sys.stderr)
         return 2
 
 

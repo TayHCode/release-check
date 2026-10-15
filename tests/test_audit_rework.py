@@ -454,7 +454,7 @@ class ReworkTests(unittest.TestCase):
         output = ("Error: Permission denied: '" + str(path) + "'\nRetry Debian/Ubuntu HiddenPerson").encode()
         with patch.object(rc, 'command', return_value=(1, output)):
             code, out, err = fixture.run_cli('--verify')
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertNotIn('Traceback', out + err)
         for report_path in (fixture.root / 'reports').rglob('report.*'):
             text = report_path.read_text()
@@ -514,7 +514,7 @@ class ReworkTests(unittest.TestCase):
         metadata = self.info / 'METADATA'
         metadata.write_text('\n'.join(line for line in metadata.read_text().splitlines() if not line.startswith('Name:')) + '\n')
         code, report = self.dependency_cli()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertFalse(report['ready'])
         self.assertTrue(any(f['kind'] == 'dependency-metadata-invalid' for f in report['findings']))
 
@@ -531,7 +531,7 @@ class ReworkTests(unittest.TestCase):
         with patch.object(rc, 'command') as call:
             code, out, err = fixture.run_cli('--verify')
         call.assert_not_called()
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 2)
         self.assertNotIn('Traceback', out + err)
         report = json.loads(next((fixture.root / 'reports').rglob('report.json')).read_text())
         kinds = {f['kind'] for f in report['findings']}
@@ -717,7 +717,7 @@ class ReworkTests(unittest.TestCase):
                     with (self.info / 'METADATA').open('a') as metadata:
                         metadata.write('Invalid header\nLicense-Expression: GPLv3\n')
                 code, report = self.dependency_cli(self.bound_evidence(MIT))
-                self.assertEqual(code, 1)
+                self.assertEqual(code, 1 if kind == 'second-unknown' else 2)
                 self.assertFalse(report['ready'])
                 self.assertEqual(report['reviewed_count'], 0)
 

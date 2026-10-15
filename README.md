@@ -32,29 +32,38 @@ release-check /path/to/repository --denylist /private/terms.json --reports /priv
 
 Alternatively run `python3 release_check.py` directly without installing it.
 `RELEASE_CHECK_DENYLIST` and `RELEASE_CHECK_REPORTS` supply the two path defaults.
-Explicit `--denylist` and `--reports` flags override these environment variables:
-
-```sh
-export RELEASE_CHECK_DENYLIST=/private/terms.json
-export RELEASE_CHECK_REPORTS=/private/reports
-release-check /path/to/repository
-```
-
 With no report override, reports go to `~/.local/state/release-check`.
-Missing denylist configuration exits 2 with the exact flags and environment
-variables to supply; an empty report default also explains how to set it.
 The denylist is mandatory, read only at runtime and never copied to an export.
 Keep it outside the repository. Formats: a JSON string array, an object containing
 `terms`, an object containing `categories` with lists or `{terms: [...]}`, or one
 term per line. Term indices are zero-based, in input order; category order is
-JSON insertion order. Matching is case-insensitive. Purely alphabetic terms
-(`str.isalpha()`) match whole tokens only: Unicode letters, digits and underscores
-are word characters. Synthetic term `cat` blocks in `cat`, `CAT`, `cat-file`,
-`cat.txt` and `/cat/`; it does not match `cats`, `bobcat`, `cat_file`, `cat2` or
-`catFood`. Terms containing nonletters, such as emails, handles and paths, match
-literal strings. Embedded plain words produce no findings or review entries.
-Denylist hits and secrets cannot be waived. Report paths and diagnostics remain
-conservatively redacted without exposing private terms.
+JSON insertion order. Matching stays case-insensitive and literal. Purely alphabetic
+terms use Unicode letters (`str.isalpha()`): a whole word or separate component
+blocks, while a hit confined to one longer letter component is reviewable.
+Digits, punctuation, straight/curly apostrophes, underscores, hyphens, dots, slashes
+and `@` delimit components, so terms in snake_case identifiers, filenames, paths,
+URLs, email addresses and hyphenated words still block when separate components.
+CamelCase splits at lowercase-to-uppercase transitions and before an uppercase
+letter followed by lowercase after an uppercase letter (`HTTPServer` splits into
+`HTTP` and `Server`). Whole components and hits crossing these transitions block;
+hits starting at an ambiguous uppercase-acronym/lowercase join also block
+(`HTTPcat` might mean `HTTP` plus `cat`).
+Substrings within a longer component are reviewable. Combining marks, invisible
+format characters or decoding replacements beside a hit stay blocking because
+their boundaries are uncertain. All-uppercase or all-lowercase
+letter runs have no case transitions. Thus synthetic term `cat` blocks in `cat`,
+`cat's`, `cat_file`, `cat-file`, `cat.txt`, `/cat/`, `cat [at] example.com`, `catFood`
+and `HTTPcat`, but is reviewable in `cats`, `bobcat`, `scatter` and `SCATTER`.
+Terms containing any nonletter keep their existing substring rule, including the
+existing ASCII-alphanumeric boundaries for alphanumeric aliases of at most three
+characters. Denylist findings can be accepted only by an exact owner approval.
+
+Reports list embedded alphabetic hits separately in `reviewable_findings`, with
+`reviewable_count` and a nonblocking Markdown section. They retain safe file paths,
+line numbers, term indices and fingerprints, without matched terms or surrounding
+text. They do not count as blockers or as approved (`reviewed_count`) findings,
+do not require scrub replacements, and cannot change the exit status on their own.
+Filename redaction and venv diagnostic redaction still cover every substring.
 
 ## What is checked
 
@@ -62,33 +71,19 @@ conservatively redacted without exposing private terms.
   cache and build directories; Git metadata is scanned separately.
 - Every commit reachable from local refs and reflogs, its author/committer/message,
   every historical filename and distinct blob/path pair. Shallow history blocks.
-- Owner-identifying names, family/agent names, emails, handles, hosts and home
-  paths supplied in the external denylist; known-private repository references,
-  common key formats, labelled credentials, bearer tokens and credential URLs.
-  Random-looking constants and filenames alone are not secrets. Media is listed
-  for human review.
-- A known SPDX licence in the top-level LICENSE/COPYING file and agreement with
-  pyproject.toml or package.json declarations; dependency licence checks after
-  installation, excluding the project's own distribution by its declared name.
-  Other licence mentions do not identify the project's licence.
+- Denylist terms, email/phone/IP addresses, tailnet and internal hostnames, home
+  paths, known-private repository references, credential files, common key formats,
+  labelled credentials and high-entropy strings. Media is listed for human review.
+- Standard MIT license wording and metadata consistency; dependency metadata and
+  license-file evidence after installation. Dependency-free `package.json` projects
+  are accepted under the restrictions below. Other root licenses and dependency
+  ecosystems require manual review. NOTICE, UPSTREAM and license files are protected.
 - README, limitations, CONTRIBUTING, SECURITY, issue templates, tests and declared
   quickstart, test, lint and type commands. Configured Ruff/mypy checks must be listed.
 
 Pass known-private repositories with repeated `--private-repo owner/name` flags.
 The tool never calls a hosting API to infer visibility. Supply this list separately
 from the repository; public and private URLs look the same without that evidence.
-
-Every email address blocks unless it uses `example.com`, `example.org` or
-`example.net`, a Git noreply domain, or the exact local part `git`, `noreply` or
-`no-reply` (case-insensitive). Numeric package versions such as `python@3.11` are
-not email addresses. Real home paths under `/home/<name>/` and
-`/Users/<name>/` block; the documented placeholders `/home/user/`, `/home/you/`
-and `/Users/name/` pass. Put owner identifiers that do not fit these documented
-placeholders in the external denylist. Documentation IP addresses
-(`192.0.2.x`, `198.51.100.x`, `203.0.113.x`), `/workspace/sample-project`,
-protocol constants and GitHub API URLs need no approvals. Denied hosts such as a
-synthetic `windows-01` remain detectable as literal strings. Secrets are still
-checked everywhere.
 
 ## Manifest and verification
 
@@ -123,7 +118,36 @@ output is discarded. Failed venv creation is the exception: reports include a
 privacy-redacted diagnostic tail of at most 1000 characters.
 `--timeout` bounds each command (default 300 seconds). Pip may contact package indexes.
 
-Approvals acknowledge a specific reviewed media file or dependency license finding:
+For non-Python commands, optionally add `"verify_tools": ["node"]` to the manifest.
+The list accepts at most eight distinct bare executable names matching
+`^[A-Za-z0-9._+-]+$`, excluding `.` and `..`; paths and command arguments are invalid.
+Only absolute entries on the caller's PATH are searched; empty and relative entries
+are ignored. Each tool and its resolved symlink target must be outside the audited
+repository, original source tree, report directory and export directory. Its target
+must be an absolute regular executable file. Accepted tools are symlinked into the
+isolated venv bin directory before commands run. A missing, unsafe, non-executable
+or conflicting tool blocks verification with `verify-tool-missing`.
+The caller's PATH is not inherited; the existing system PATH suffix and isolated
+HOME, XDG directories and TMPDIR remain in effect. Declare supporting tools separately
+when a tool needs other executables outside the system PATH.
+
+Every `package.json` anywhere in the audited tree, excluding `.git`, is checked
+independently. A manifest avoids dependency-ecosystem manual review only when it is
+a valid JSON object of at most 4 MiB with no duplicate keys, no nonempty
+`dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`,
+`bundledDependencies`, `bundleDependencies`, `workspaces`, `overrides` or `resolutions`,
+and no lifecycle script keys named `install`, `prepare`, `publish` or `dependencies`,
+or starting with `pre` or `post` (including empty commands). Scripts must be an
+object of string commands. Any legacy `licenses` key, truthy `gypfile` or
+`binding.gyp` anywhere in the tree requires manual review. There must be no lockfile
+or `node_modules` anywhere in the tree or tracked paths. Recognized lockfiles are
+`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`
+and `bun.lockb`. Invalid or oversized metadata and symlinked manifests remain for
+manual review. A present `license` must be a string equal to the detected licence
+identifier; discrepancies produce `license-metadata-mismatch`. Nested findings name
+the manifest's relative path. Other ecosystem filenames keep requiring manual review.
+
+Approvals acknowledge a specific non-secret false positive or reviewed media file:
 `scope`, `kind`, `path`, `fingerprint`. They apply to that exact scope/path/value;
 they do not match every occurrence globally. Never approve unseen media. Secret
 findings cannot be waived. Review approvals as code changes.
@@ -135,10 +159,15 @@ authenticate the author of an approval.
 
 ### Approving findings
 
-Copy the exact `scope`, `kind`, `path` and `fingerprint` from a media or dependency
-license finding. Dependency approvals require a human-readable reason. Denylist
-and secret findings cannot be accepted; existing approvals for them match nothing
-and appear as stale. Never include a private term in a reason.
+Copy the exact `scope`, `kind`, `path` and `fingerprint` from a finding. Add a
+human-readable `reason` for denylist approvals. This supports verified public data,
+such as a public IRS record; accepted findings stay visible in reports, and
+approvals that match nothing are listed as stale. Never include the private term
+in the reason.
+
+```json
+{"scope":"tree","kind":"denylist","path":"public-data.csv","fingerprint":"0123456789abcdef","reason":"Verified this exact public IRS record."}
+```
 
 Dependency licenses are recognized from SPDX expressions, metadata and classifiers.
 Common permissive licenses (including generic BSD, MIT, Apache, ISC, Zlib and Python)
@@ -252,8 +281,8 @@ replacement source strings. Make content fixes in a source worktree and rerun.
 working files, without `.git`, generated environments, credential files or manifest
 exclusions. It creates exactly one commit with a generic identity, no remote and no
 original history. It scans the entire export again, including its new metadata,
-licence/quality checks and clean-clone verification. Findings do not silently
-rewrite source, licence text or file names.
+license/quality checks and clean-clone verification. Missing historical attribution
+blocks it. Findings do not silently rewrite source, license text or file names.
 A blocked export is a **private review artifact**, never a publishable success.
 
 JSON and Markdown reports live in `<report-root>/<repo>/<UTC-timestamp>/` with
@@ -263,14 +292,62 @@ paths, line numbers, term indices, object IDs and one-way SHA-256 fingerprints (
 matched content, credentials or denylist terms are included. Quickstart/check
 command output is represented only by fingerprints; the bounded, redacted venv
 diagnostic tail is included when venv creation fails. The summary
-prints only a relative report locator. Exit codes: 0 = audited target ready, 1 =
-blockers, 2 = incomplete/error. With an export, exit 0 refers to the export; the
-original repository can still have history findings.
+prints only a relative report locator. Exit codes: 0 = PASS, 1 = FAIL, 2 = INCOMPLETE.
+With an export, the exit code follows the export outcome; the original repository
+can still have history findings.
+
+## Outcome and export receipt
+
+Every audit report, including the export report, has an `outcome` (`PASS`, `FAIL`
+or `INCOMPLETE`) and sorted machine-readable `reasons`. The older `ready` field is
+deprecated and remains for compatibility; it is true only when the outcome is
+`PASS`. PASS requires no unresolved findings, passed verification, accepted license
+and verified dependency status, plus at least one accounted tree file and commit.
+Unknown or missing coverage or verification evidence produces INCOMPLETE, including
+verification that was not run, unavailable tools, unsupported files, pending
+media review and missing license or dependency evidence. A change to the export while
+it is being audited is FAIL (`candidate-mutated`). Known violations such as leaks, denylist hits,
+failed commands, README commands that contradict the manifest, and missing
+attribution produce FAIL. FAIL takes precedence over INCOMPLETE, while reasons for
+both remain in the report. The stdout summary includes `outcome`; with `--export`
+it also includes `export_outcome`. The process exit code follows that export
+outcome. In particular, verification-not-run, missing verification tools and
+unsupported coverage now exit 2 when no known violation makes the outcome FAIL.
+
+When `--export` is used, `receipt.json` is written beside `report.json` in the
+reports directory, never inside the export. A reports directory inside the export
+is refused. The receipt binds the export inventory (every path including empty
+directories, full permission bits, file bytes, symlink targets without following
+links, the export's `.git` files other than the index, refs and HEAD), manifest recipe,
+policy (denylist and private-repository list digests, default exclusions, verify
+flag and timeout), and scanner (release-check version and implementation digest,
+Python version and Git version). It also records export HEAD and tree identifiers
+and a `receipt_sha256`. It contains no denylist terms or private repository names.
+
+Validate a receipt without running an audit or verification:
+
+```sh
+release-check --validate-receipt /private/reports/.../receipt.json /path/to/export \
+  --denylist /private/terms.json --verify
+```
+
+Pass the same `--manifest`, `--private-repo` and `--timeout` options used for the
+audit when applicable. An unchanged PASS receipt exits 0. Changes to export bytes,
+modes, paths, refs, untracked files, recipe, policy flags or scanner produce
+INCOMPLETE with reason `receipt-stale` and a `mismatched` list. An unparseable,
+tampered, duplicate-key or unknown-schema receipt produces INCOMPLETE with reason
+`receipt-invalid`. A receipt created for a FAIL or INCOMPLETE export preserves that
+outcome if its bindings still match.
+
+The receipt is a hash binding, not a signature: it does not authenticate who wrote
+it. Keep it outside the export and read it from the trusted job record. No dedicated
+external secret scanners are involved yet. PASS means only that the declared checks
+passed on that export.
 
 ## Honest limitations
 
 This is a release gate, not a security or legal guarantee. False positives are
-expected. Unrecognized secret formats may escape detection. The tool does not OCR images,
+expected. Entropy cannot identify every secret. The tool does not OCR images,
 recognize faces, unpack archives, discover nonlocal Git refs or unreachable objects,
 or determine hosted repository visibility. History coverage is local refs/reflogs;
 fetch any required refs yourself first. Symlinks and submodules block coverage and
@@ -309,14 +386,14 @@ fresh verification venv; no package download or real dependency is needed.
 
 `test_v3_r2_cli_permissive_weak_and_unlabelled` checks MIT, Apache, BSD, LGPL, MPL,
 EPL and an unlabelled package with the bundled MIT license text. Each actual audit
-must exit **0**, report `ready: true`, zero blocked dependencies and no findings.
+must exit **0**, report `outcome: PASS` (`ready: true` for compatibility), zero blocked dependencies and no findings.
 The unlabelled case must also appear in `accepted_on_license_file`.
 Control cases for GPL, AGPL and an unlabelled package without license evidence
-must exit **1** and report `ready: false`; those are expected blockers, so the
+must exit **1** and report `outcome: FAIL` (`ready: false` for compatibility); those are expected blockers, so the
 test command still exits 0.
 
 The same command proves these bypasses remain blocked. Each actual audit
-must exit **1** and report `ready: false`; the tests pass only when it does:
+must exit **1** and report `outcome: FAIL` (`ready: false` for compatibility); the tests pass only when it does:
 
 - `test_finding_1_cli_placeholder_cannot_report_ready`: NOASSERTION cannot hide GPL.
 - `test_finding_2_cli_proprietary_label_blocks`: mentioning MPL in proprietary
@@ -332,7 +409,7 @@ must exit **1** and report `ready: false`; the tests pass only when it does:
   and a second unknown document cannot be waived by another file's digest.
 
 `test_final_gate_cli_generic_classifier_is_neutral` proves MIT, Apache, BSD and
-LGPL remain ready alongside the generic OSI classifier.
+LGPL can pass alongside the generic OSI classifier.
 
 `test_notice_cli_cannot_accept_unlabelled_package_or_erase_restrictions` proves
 NOTICE alone cannot qualify an unlabelled package, and its restrictive assertions
@@ -342,21 +419,3 @@ It also checks standard Apache/MPL/LGPL texts, restrictive legacy fields, a seco
 unknown license candidate, classifier recognition, bound review evidence and
 malformed metadata. Complete standard texts are bundled under `tests/fixtures/licenses`
 with their original notices, so the proof does not depend on host-installed files.
-
-## Disposable audit fixtures
-
-For command-proof runners that cannot retain shell activation, use explicit venv
-paths after `python3 -m venv .venv`: `.venv/bin/python -m pip install .` and
-`.venv/bin/release-check --help`. The Quickstart activation form remains supported.
-
-A synthetic audit project needs a complete recognized license, not just the word
-MIT. Copy this project's complete MIT `LICENSE` into the fixture; retain its grant
-and attribution. Add `README.md` with a Limitations heading, `CONTRIBUTING.md`,
-`SECURITY.md`, an issue template under `.github/ISSUE_TEMPLATE/` and a real test
-under `tests/`. Declare exact README command lines and test commands in the
-fixture's `release-check.json`. Keep a synthetic denylist outside the fixture Git
-root, and export outside that root. A dependency-free fixture can declare
-`python --version` as its quickstart and a standard-library unittest as its check.
-Commit it with an example-domain Git identity. With all required files present,
-`--verify --export` should report ready true and zero findings. A single MIT label
-without its grant correctly blocks; an export alone does not prove readiness.

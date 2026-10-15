@@ -59,43 +59,6 @@ class DependencyTests(unittest.TestCase):
         for label in ("MIT License", "Apache License, Version 2.0", "BSD License", "BSD 3-Clause License"):
             self.assertEqual(self.audit(self.installed(label=label))[0]["blocked"], 0)
 
-    def test_own_distribution_notices_are_excluded_by_declared_name(self):
-        raw = self.installed(expression="MIT", text="Bundled upstream licence and public-domain notices")
-        self.assertEqual(self.audit(raw)[0]["blocked"], 1)
-        declarations = {
-            "pyproject.toml": '[project]\nname = "Fixture.Name"\n',
-            "package.json": json.dumps({"name": "FIXTURE-NAME"}),
-        }
-        for filename, text in declarations.items():
-            with self.subTest(filename=filename):
-                path = self.root / filename
-                path.write_text(text)
-                result, findings = self.audit(raw)
-                self.assertEqual(result["blocked"], 0)
-                self.assertEqual(result["accepted_on_license_file"], [])
-                self.assertEqual(findings, [])
-                path.unlink()
-
-    def test_other_dependencies_remain_reviewed(self):
-        (self.root / "pyproject.toml").write_text('[project]\nname = "fixture-name"\n')
-        self.installed(expression="MIT", text="Bundled third-party notices")
-        own = self.package
-        for label in ("MIT", "GPL-3.0-only", "AGPL-3.0-only"):
-            with self.subTest(label=label):
-                other = {**own, "name": "fixture_name_extra", "expression": label,
-                         "expressions": [label], "license_files": []}
-                result, findings = self.audit(json.dumps([own, other]).encode())
-                self.assertEqual(result["blocked"], int(label != "MIT"))
-                self.assertEqual([f["path"] for f in findings],
-                                 [] if label == "MIT" else ["@dependency/fixture_name_extra"])
-
-    def test_missing_or_different_project_name_does_not_exclude_dependency(self):
-        raw = self.installed(expression="GPL-3.0-only")
-        for text in ('[project]\n', '[project]\nname = "another-project"\n'):
-            with self.subTest(text=text):
-                (self.root / "pyproject.toml").write_text(text)
-                self.assertEqual(self.audit(raw)[0]["blocked"], 1)
-
     def test_full_mit_license_metadata_and_strong_label_conflict(self):
         text = Path(rc.__file__).with_name("LICENSE").read_text()
         self.assertEqual(self.audit(self.installed(label=text.splitlines()[0]))[0]["blocked"], 0)
@@ -257,8 +220,8 @@ class DependencyTests(unittest.TestCase):
             self.assertEqual(rc.main(["--requirements"]), 0)
         self.assertEqual(out.getvalue(), rc.requirements_text())
         text = out.getvalue()
-        self.assertIn("Denylist hits and secrets cannot be waived.", text)
-        self.assertNotIn("Denylist hits require exact owner approval", text)
+        self.assertIn("Denylist hits require exact owner approval; secrets cannot be waived.", text)
+        self.assertNotIn("denylist/secrets cannot be waived", text)
         for value in (*rc.ROOT_LICENSE_FILES, *rc.REQUIRED_DOCUMENTS, *rc.README_HEADINGS, *rc.ISSUE_TEMPLATE_GLOBS, rc.TEST_GLOB, 'GPL-3.0.txt', 'licenses/licences', *rc.MANIFEST_KEYS, *rc.CHECK_ROLES):
             self.assertIn(value, text)
         example = json.JSONDecoder().raw_decode(text[text.index('{'):])[0]

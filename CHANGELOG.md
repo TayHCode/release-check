@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0 — 2026-10-15
+
+Compared with public 0.4.0:
+
+- Replace private-looking examples and fixture identifiers with neutral documentation
+  values; construct detector-negative samples at runtime and review only exact
+  scanner self-matches through manifest approvals.
+- Confine the receipt mutation regression to its explicit temporary candidate.
+
+- Add PASS/FAIL/INCOMPLETE outcomes and sorted reason codes to reports and stdout;
+  retain `ready` as a deprecated PASS compatibility field and use outcome-based
+  exit codes.
+- Write an external `receipt.json` for exports, binding the inventory, recipe,
+  policy and scanner; add read-only `--validate-receipt` with stale/invalid receipt
+  reporting and document its hash-only trust limits.
+- Ignore relative and empty verification PATH entries; reject executable paths and
+  symlink targets inside the audited repository, original source, reports or export.
+  Preserve these exclusions through export verification and block bin-directory escapes.
+- Check every `package.json` outside `.git`, including nested and symlinked manifests.
+  Require review for legacy `licenses`, all `pre`/`post` script keys and lifecycle
+  hooks, `gypfile` and any `binding.gyp`; retain bounded, duplicate-free JSON checks.
+- Accept dependency-free `package.json` projects only with bounded, duplicate-free
+  JSON, no dependency declarations, install lifecycle commands, root or tracked
+  lockfiles or `node_modules`; check declared licences against the root licence.
+- Add manifest `verify_tools` to resolve up to eight declared executables on the
+  caller's PATH and link them into the isolated verification bin directory. Missing
+  or conflicting tools block verification without inheriting the caller's environment.
+- Incomplete runs now exit 2; known failures exit 1 and PASS exits 0.
+
 ## 0.4.0 — 2026-10-14
 
 Compared with public 0.3.0:
