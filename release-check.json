@@ -1,6 +1,77 @@
 {
-  "exclude": [".scratch/", "*.egg-info"],
-  "approvals": [],
+  "exclude": [],
+  "approvals": [
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "a541acfac2e64958",
+      "reason": "The POSIX home-path detection expression matches its own regex character class; this is scanner syntax, not a user home."
+    },
+    {
+      "scope": "tree",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "b9f44d4003eb7eda",
+      "reason": "The macOS home-path detection expression matches its own regex character class; this is scanner syntax, not a user home."
+    },
+    {
+      "scope": "tree",
+      "kind": "email",
+      "path": "release_check.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "The private-repository URL normalization rule contains regex punctuation resembling an address; no contact address is present."
+    },
+    {
+      "scope": "tree",
+      "kind": "ipv6",
+      "path": "release_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "reason": "Double-colon syntax is used by IPv6 parsing and SPDX classifier punctuation; these exact scanner tokens are not a host address."
+    },
+    {
+      "scope": "tree",
+      "kind": "tailnet-ip",
+      "path": "release_check.py",
+      "fingerprint": "4b2228c26597aeca",
+      "reason": "The CGNAT prefix in the scanner defines the full address block to detect; it is a protocol rule, not an assigned device address."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "a541acfac2e64958",
+      "reason": "The POSIX home-path detection expression matches its own regex character class; this is scanner syntax, not a user home."
+    },
+    {
+      "scope": "history",
+      "kind": "home-path",
+      "path": "release_check.py",
+      "fingerprint": "b9f44d4003eb7eda",
+      "reason": "The macOS home-path detection expression matches its own regex character class; this is scanner syntax, not a user home."
+    },
+    {
+      "scope": "history",
+      "kind": "email",
+      "path": "release_check.py",
+      "fingerprint": "3de132cd98be7bf2",
+      "reason": "The private-repository URL normalization rule contains regex punctuation resembling an address; no contact address is present."
+    },
+    {
+      "scope": "history",
+      "kind": "ipv6",
+      "path": "release_check.py",
+      "fingerprint": "71546855d6279ef7",
+      "reason": "Double-colon syntax is used by IPv6 parsing and SPDX classifier punctuation; these exact scanner tokens are not a host address."
+    },
+    {
+      "scope": "history",
+      "kind": "tailnet-ip",
+      "path": "release_check.py",
+      "fingerprint": "4b2228c26597aeca",
+      "reason": "The CGNAT prefix in the scanner defines the full address block to detect; it is a protocol rule, not an assigned device address."
+    }
+  ],
   "quickstart": [
     {
       "file": "README.md",
